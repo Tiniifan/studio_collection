@@ -474,7 +474,7 @@ def get_tint_dependencies(material):
     if render_default is None:
         return None
 
-    stages = resources.load_combiner(engine_id, render_default.data["combiner"])
+    stages = resources.render_default_stages(engine_id, render_default)
 
     if not stages:
         return None

@@ -6,7 +6,7 @@ from bpy.app.handlers import persistent
 from bpy.props import EnumProperty, StringProperty
 
 from .engines import engine_items, get_engine, is_default_engine, DEFAULT_ENGINE_ID, ALL_ENGINES
-from . import render_defaults, game_manager
+from . import render_defaults, game_manager, custom_shaders
 from ..templates import TEMPLATE_ITEMS, DEFAULT_TEMPLATE_ID, get_template
 from ..formats import atr, mtr
 
@@ -141,12 +141,56 @@ def render_default_items(scene=None):
 
     return _items_cache[key]
 
+_mesh_items_cache = {}
+
+def mesh_render_default_items(mesh, scene=None):
+    """Enum items of the render defaults a mesh can use: the custom shaders of the blend, then the ones of the scene engine."""
+    shaders = custom_shaders.get_shaders()
+
+    if len(shaders) == 0:
+        return render_default_items(scene)
+
+    shader_names = [tree.name for tree in shaders]
+    key = (game_manager.data_engine_id(get_scene_engine_id(scene)),) + tuple(shader_names)
+
+    if key not in _mesh_items_cache:
+        items = []
+
+        for name in shader_names:
+            items.append((name, name, "Custom shader of the blend (Shader Editor), written in the archive of the mesh", 'NODE_MATERIAL', len(items)))
+
+        for item in render_default_items(scene):
+            # A custom shader hides the render default of fix.xr that has its name
+            if item[0] not in shader_names:
+                items.append((item[0], item[1], item[2], 'NONE', len(items)))
+
+        _mesh_items_cache[key] = items
+
+    return _mesh_items_cache[key]
+
+def set_mesh_render_default(mesh, name):
+    """Give the mesh a render default by its name: a custom shader of the blend or a render default of the engine."""
+    properties = mesh.level5_properties
+    shader = bpy.data.node_groups.get(name)
+
+    if custom_shaders.is_shader(shader):
+        properties.shader = shader
+    else:
+        properties.shader = None
+
+    properties.render_default = name
+    properties.unresolved_render_program = ""
+
 def scene_meshes(scene):
     return {obj.data for obj in scene.objects if obj.type == 'MESH'}
 
 def assign_render_default(mesh, engine_id):
     """Give the mesh a render default of the engine, returns True when its value changed."""
     properties = mesh.level5_properties
+
+    # A custom shader is kept whatever the engine
+    if custom_shaders.get_mesh_shader(mesh) is not None:
+        return False
 
     kept = None
     if properties.unresolved_render_program:
@@ -174,8 +218,12 @@ def assign_render_default(mesh, engine_id):
 
     return True
 
-def assign_render_program(mesh, render_program_hash, engine_id):
-    """Give the mesh a render program, the export writes its hash back when the engine doesn't have it."""
+def assign_render_program(mesh, render_program_hash, engine_id, shaders=None):
+    """Give the mesh a render program, the shaders of its archive come first like in the game, the export writes an unknown hash back."""
+    if shaders and render_program_hash in shaders:
+        set_mesh_render_default(mesh, shaders[render_program_hash].name)
+        return custom_shaders.make_render_default(shaders[render_program_hash], engine_id)
+
     found = render_defaults.find_render_default_by_hash(engine_id, render_program_hash)
 
     if found is None:
@@ -187,14 +235,20 @@ def assign_render_program(mesh, render_program_hash, engine_id):
 
     return found
 
-def assign_imported_render_program(mesh, render_program_hash, engine_id=None):
+def assign_imported_render_program(mesh, render_program_hash, engine_id=None, shaders=None):
     engine_id = engine_id or get_scene_engine_id()
 
-    if assign_render_program(mesh, render_program_hash, engine_id) is None:
+    if assign_render_program(mesh, render_program_hash, engine_id, shaders) is None:
         print(f"[Studio Eleven] {mesh.name}: render program {render_program_hash:08X} is not part of {engine_id}")
 
 def get_mesh_render_default(mesh, engine_id=None):
-    return render_defaults.resolve_render_default(engine_id or get_scene_engine_id(), mesh.level5_properties.render_default)
+    engine_id = engine_id or get_scene_engine_id()
+    shader = custom_shaders.get_mesh_shader(mesh)
+
+    if shader is not None:
+        return custom_shaders.make_render_default(shader, engine_id)
+
+    return render_defaults.resolve_render_default(engine_id, mesh.level5_properties.render_default)
 
 def get_mesh_render_program_hash(mesh, engine_id=None):
     unresolved = mesh.level5_properties.unresolved_render_program

@@ -68,6 +68,35 @@ nodes_ordered = [
 ]
 
 ##########################################
+# Render library
+##########################################
+
+# A model can hold a render library like fix.xr: types of the V2 library list (written in this order), slots of the V1 XRES header
+RENDER_LIBRARY_TYPES = {
+    "shader_binaries": 100,
+    "vertex_programs": 110,
+    "combiners": 120,
+    "render_programs": 190,
+    "luts": 200,
+}
+
+RENDER_LIBRARY_SLOTS = {
+    "shader_binaries": 2,
+    "vertex_programs": 3,
+    "combiners": 4,
+    "luts": 5,
+    "render_programs": 10,
+}
+
+RENDER_LIBRARY_LENGTHS = {
+    "shader_binaries": 12,
+    "vertex_programs": 20,
+    "combiners": 8,
+    "render_programs": 16,
+    "luts": 8,
+}
+
+##########################################
 # Sampler
 ##########################################
 
@@ -181,13 +210,14 @@ def open_res(data):
     text_section = data[header.StringOffset:len(data)]
     string_table = read_string_table(text_section)
     
-    def read_section_table(data, tableOffset, tableCount):
+    def read_section_table(data, tableOffset, tableCount, skipped_types=()):
         for i in range(tableCount):
             pos = tableOffset + i * 8
             
             headerTable = ResHeaderTable(data, pos)
             pos += 8
             
+            if headerTable.Type in skipped_types:               continue
             if RESType(headerTable.Type) == RESType.NULL:       continue
             if RESType(headerTable.Type) == RESType.MESH_GROUP: continue
             if RESType(headerTable.Type) not in items:
@@ -232,7 +262,8 @@ def open_res(data):
 
                     items[RESType(headerTable.Type)][obj_hash] = {"name": obj_name, "textures": linked_textures, "texture_modes": texture_modes}
     
-    read_section_table(data, header.MaterialTableOffset, header.MaterialTableCount)
+    # The render library shares the numbers of the node tables, open_render_library reads it
+    read_section_table(data, header.MaterialTableOffset, header.MaterialTableCount, RENDER_LIBRARY_TYPES.values())
     read_section_table(data, header.NodeOffset, header.NodeCount)
     
     return items
@@ -349,8 +380,134 @@ def open_xres(data):
     read_type(data, header.MTNINF,         RESType.MTNINF)
     read_type(data, header.IMMINF,         RESType.IMMINF)
     read_type(data, header.MTMINF,         RESType.MTMINF)
-    
+
     return items
+
+##########################################
+# Render library Function
+##########################################
+
+def new_render_library():
+    render_library = {}
+
+    for kind in RENDER_LIBRARY_TYPES:
+        render_library[kind] = []
+
+    return render_library
+
+def get_hash_name(obj_hash, string_table):
+    if obj_hash in string_table:
+        return string_table[obj_hash]
+
+    return f"0x{obj_hash:08X}"
+
+def get_name_hash(name):
+    # A name the archive didn't keep is written back as its hash
+    if name.startswith("0x") and len(name) == 10:
+        return int(name, 16)
+
+    return crc32(name.encode("shift-jis"))
+
+def read_render_entry(kind, entry, string_table):
+    obj_hash = unpack_from("<I", entry, 0)[0]
+
+    # The shader binaries have no name
+    name = ""
+    if obj_hash != 0:
+        name = get_hash_name(obj_hash, string_table)
+
+    item = {
+        "name": name,
+        "data": entry[8:],
+    }
+
+    if kind == "render_programs":
+        vertex_program_hash, combiner_hash = unpack_from("<II", entry, 8)
+        item["vertex_program"] = get_hash_name(vertex_program_hash, string_table)
+        item["combiner"] = get_hash_name(combiner_hash, string_table)
+
+    return item
+
+def open_render_library(data):
+    data = compressor.decompress(data)
+    render_library = new_render_library()
+
+    if data[:4] == b"XRES":
+        string_table = read_string_table(data[unpack_from("<H", data, 4)[0]:])
+
+        for kind, slot in RENDER_LIBRARY_SLOTS.items():
+            offset, count = unpack_from("<HH", data, slot * 4)
+            length = RENDER_LIBRARY_LENGTHS[kind]
+
+            for i in range(count):
+                pos = offset + i * length
+                render_library[kind].append(read_render_entry(kind, data[pos:pos+length], string_table))
+
+        return render_library
+
+    header = ResHeader(data[8:])
+    string_table = read_string_table(data[header.StringOffset:])
+
+    for i in range(header.MaterialTableCount):
+        header_table = ResHeaderTable(data, header.MaterialTableOffset + i * 8)
+
+        for kind, res_type in RENDER_LIBRARY_TYPES.items():
+            if header_table.Type == res_type:
+                for j in range(header_table.Count):
+                    pos = header_table.DataOffset + j * header_table.Length
+                    render_library[kind].append(read_render_entry(kind, data[pos:pos+header_table.Length], string_table))
+
+    return render_library
+
+def add_library_string(name, string_table, string_offsets):
+    if name not in string_offsets:
+        string_offsets[name] = len(string_table)
+        string_table += name.encode("shift-jis") + int(0).to_bytes(1, 'little')
+
+    return string_offsets[name], string_table
+
+def make_render_library(render_library, string_table):
+    """The RES entries of a render library, the names are added to the string table."""
+    sections = {}
+    string_offsets = {}
+
+    if render_library is None:
+        return sections, string_table
+
+    for kind, items in render_library.items():
+        entries = []
+
+        for item in items:
+            entry = bytes()
+
+            if item["name"] == "":
+                entry += bytes(8)
+            else:
+                entry += get_name_hash(item["name"]).to_bytes(4, 'little')
+
+                if item["name"].startswith("0x"):
+                    entry += bytes(4)
+                else:
+                    string_offset, string_table = add_library_string(item["name"], string_table, string_offsets)
+                    entry += int(string_offset).to_bytes(4, 'little')
+
+            if kind == "render_programs":
+                entry += get_name_hash(item["vertex_program"]).to_bytes(4, 'little')
+                entry += get_name_hash(item["combiner"]).to_bytes(4, 'little')
+
+                # The names of fix.xr are kept so that a new import shows them
+                for name in (item["vertex_program"], item["combiner"]):
+                    if not name.startswith("0x"):
+                        string_offset, string_table = add_library_string(name, string_table, string_offsets)
+            else:
+                entry += item["data"]
+
+            entries.append(entry.ljust(RENDER_LIBRARY_LENGTHS[kind], b'\x00'))
+
+        if entries:
+            sections[kind] = entries
+
+    return sections, string_table
 
 def get_animation_types(animations):
     animation_types = []
@@ -536,8 +693,18 @@ def make_library(meshes = [], armature = None, textures = {}, animations = [], o
         
     return items, string_table
                 
-def write_res(magic, items, string_table):
-    materials = {key: value for key, value in items.items() if key in materials_ordered}
+def write_res(magic, items, string_table, render_sections=None):
+    # The game walks the library list by increasing type, the render library comes before the materials
+    materials = {}
+    if render_sections:
+        for kind, res_type in RENDER_LIBRARY_TYPES.items():
+            if kind in render_sections:
+                materials[res_type] = render_sections[kind]
+
+    for key, value in items.items():
+        if key in materials_ordered:
+            materials[key.value] = value
+
     nodes = {key: value for key, value in items.items() if key in nodes_ordered}
 
     header = {
@@ -550,8 +717,9 @@ def write_res(magic, items, string_table):
         'NodeCount': len(nodes),
     }
 
+    table_count = len(materials) + len(nodes)
     header_pos = 20
-    data_pos = header_pos + len(items) * 8
+    data_pos = header_pos + table_count * 8
 
     with io.BytesIO() as writer_res:
         with io.BytesIO() as writer_table:
@@ -562,14 +730,14 @@ def write_res(magic, items, string_table):
 
                     for res_type, res_value in materials.items():
                         res_value_length = 0
-                        
+
                         if len(res_value) > 0:
                             res_value_length = len(res_value[0])
-                            
+
                         material_header_table = {
                             '_dataOffset': data_pos >> 2,
                             'Count': len(res_value),
-                            'Type': res_type.value,
+                            'Type': res_type,
                             'Length': res_value_length,
                         }
 
@@ -603,7 +771,7 @@ def write_res(magic, items, string_table):
                         writer_data.write(b''.join(res_value))
 
                 # String table
-                header['_stringOffset'] = writer_data.tell() + 20 + len(items) * 8 >> 2
+                header['_stringOffset'] = writer_data.tell() + 20 + table_count * 8 >> 2
                 writer_data.write(string_table)
                         
                 # Calculate padding for alignment
@@ -662,40 +830,62 @@ data_order = [
     RESType.TEXPROJ,
 ]
 
-def write_xres(magic, items, string_table):
+def write_xres(magic, items, string_table, render_sections=None):
     data = bytes()
-    
+
+    if render_sections is None:
+        render_sections = {}
+
     for res_type in type_order:
         if res_type in items:
             for i in range(len(items[res_type])):
                 if type_length[res_type] != len(items[res_type][i]):
                     resized_array = items[res_type][i].ljust(type_length[res_type], b'\x00')
                     items[res_type][i] = resized_array
-    
-    string_offset = 0x64 + sum(len(item) for sublist in items.values() for item in sublist)
-    
+
+    items_length = sum(len(item) for sublist in items.values() for item in sublist)
+    render_length = sum(len(entry) for entries in render_sections.values() for entry in entries)
+    string_offset = 0x64 + items_length + render_length
+
+    # The render library is written after the tables, in slots of the header the models leave empty
+    render_slots = {}
+    render_offset = 0x64 + items_length
+    for kind, entries in render_sections.items():
+        render_slots[RENDER_LIBRARY_SLOTS[kind]] = pack("<HH", render_offset, len(entries))
+        render_offset += sum(len(entry) for entry in entries)
+
     data += magic
     data += pack("<H", string_offset)
     data += pack("<H", 0x01)
-    data += bytes(0x0C)
-    
+
+    for slot in (2, 3, 4):
+        data += render_slots.get(slot, bytes(4))
+
     data_offset = 0x64
     for res_type in type_order:
-        if res_type in items:
+        if res_type == RESType.MATERIAL_TYPE_UNK1 and 5 in render_slots:
+            data += render_slots[5]
+        elif res_type in items:
             data += pack("<H", data_offset)
             data += pack("<H", len(items[res_type]))
             data_offset += sum(len(item) for item in items[res_type])
         else:
             data += pack("<HH", 0x64, 0)
-        
-        if res_type in (RESType.MATERIAL_TYPE_UNK2, RESType.MATERIAL_DATA):
+
+        if res_type == RESType.MATERIAL_TYPE_UNK2:
+            data += render_slots.get(10, bytes(4))
+        elif res_type == RESType.MATERIAL_DATA:
             data += pack("<I", 0x00)
-    
+
     for res_type in type_order:
         if res_type in items:
             for item in items[res_type]:
                 data += item
-    
+
+    for entries in render_sections.values():
+        for entry in entries:
+            data += entry
+
     data += string_table
     
     while len(data) % 4 != 0:

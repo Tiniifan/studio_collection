@@ -27,7 +27,7 @@ from ..panels.material_textures import PIXEL_FORMAT_ITEMS, WRAP_ITEMS, FILTER_IT
 from ...utils.properties import *
 from ...utils.import_files import get_import_filepaths
 from ..panels.settings import get_addon_settings
-from ...rendering import project as rendering_project
+from ...rendering import project as rendering_project, custom_shaders
 from ...controls import CameraElevenObject
 
 ##########################################
@@ -180,6 +180,8 @@ def new_archive_content(name):
         "mtr_data": [],
         "sil_data": [],
         "res_data": None,
+        "render_library": None,
+        "render_library_files": {"cmb": {}, "shdc": {}, "lut": {}},
     }
 
     for animation_type in SPLIT_EXTENSIONS:
@@ -265,6 +267,12 @@ def read_archive(data, archive_name, session):
             content["animations_data"].append(animation_manager.AnimationManager(reader=io.BytesIO(archive[file_name])))
         elif file_name == 'RES.bin':
             content["res_data"] = res.open_res(data=archive[file_name])
+            content["render_library"] = res.open_render_library(archive[file_name])
+        elif (file_name.endswith('.cmb') or file_name.endswith('.lut')) and file_name[:3].isdigit():
+            # The render library numbers its files like its RES tables
+            content["render_library_files"][file_name[-3:]][int(file_name[:3])] = archive[file_name]
+        elif file_name.endswith('.shdc') and file_name[3:6].isdigit():
+            content["render_library_files"]["shdc"][int(file_name[3:6])] = archive[file_name]
         elif file_name == 'CMR.bin':
             content["camera_hashes"] = xcmt.open(data=archive[file_name])
         elif file_name.endswith('.txp'):
@@ -522,6 +530,14 @@ def build_archive(context, content, session):
                     material_name = res_data[res.RESType.MATERIAL_DATA][material_crc32]['name']
                     txps.append([textproj_name, material_name, uv_map_index])
 
+    # The render programs of the archive become shaders of the blend, its meshes look them up first like the game
+    shaders = {}
+    if content["render_library"] is not None:
+        try:
+            shaders = custom_shaders.import_render_library(content["render_library"], content["render_library_files"], rendering_project.get_scene_engine_id(scene))
+        except Exception as e:
+            session_warning(session, f"{content['name']}: the render library can't be read: {e}")
+
     # Make meshes
     if len(content["meshes_data"]) > 0 and res_data is not None:
         for i in range(len(content["meshes_data"])):
@@ -553,7 +569,7 @@ def build_archive(context, content, session):
             mtr_material = mtr_materials.get(mesh_data['material_name'])
 
             # Create the mesh using the mesh data
-            make_mesh(mesh_data, armature=armature, bones=bones, lib=lib, txp_data=txps, atr_state=atr_state, mtr_material=mtr_material, bind_offsets=bind_offsets)
+            make_mesh(mesh_data, armature=armature, bones=bones, lib=lib, txp_data=txps, atr_state=atr_state, mtr_material=mtr_material, bind_offsets=bind_offsets, shaders=shaders)
 
         if armature is not None and len(content["sil_data"]) > 0:
             import_outlines(armature, content["sil_data"], res_data.get(res.RESType.SHADING, {}))
@@ -1137,6 +1153,22 @@ def make_xpck_files(operator, context, engine, mode, meshes = [], armature = Non
 
     files = {}
 
+    # The custom shaders of the meshes go in the render library of the archive, the game finds them before the ones of fix.xr
+    render_library = None
+    if mode == "ARMATURE" and meshes:
+        shaders = []
+        for mesh in meshes:
+            shader = custom_shaders.get_mesh_shader(bpy.data.objects[mesh.name].data)
+            if shader is not None and shader not in shaders:
+                shaders.append(shader)
+
+        try:
+            render_library, render_library_files = custom_shaders.get_library_files(shaders, engine.file_version)
+        except ValueError as error:
+            raise XpckExportError(str(error))
+
+        files.update(render_library_files)
+
     if mode == "MESH":
         if xmprs:
             files.update(create_files_dict(".prm", xmprs))
@@ -1240,10 +1272,12 @@ def make_xpck_files(operator, context, engine, mode, meshes = [], armature = Non
             texprojs=texprojs
         )
 
+        render_sections, string_table = res.make_render_library(render_library, string_table)
+
         if engine.file_version == 1:
-            files["RES.bin"] = res.write_xres(b"XRES", items, string_table)
+            files["RES.bin"] = res.write_xres(b"XRES", items, string_table, render_sections)
         else:
-            files["RES.bin"] = res.write_res(b"CHRC00\x00\x00", items, string_table)
+            files["RES.bin"] = res.write_res(b"CHRC00\x00\x00", items, string_table, render_sections)
     elif mode == "ANIMATION":
         if attach_bone == False:
             armature = None

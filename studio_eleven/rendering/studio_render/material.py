@@ -219,7 +219,7 @@ class MaterialRender:
         self.program = program
         self.state = resolved_state
         self.images = images
-        self.program_key = (engine_id, render_default.name if render_default else None)
+        self.program_key = (engine_id, render_default.key if render_default else None)
         self._palette = None
         self._palette_read = False
 
@@ -288,7 +288,7 @@ def invalidate(material_names=(), mesh_names=()):
 
 
 def _stages_of(engine_id, render_default):
-    stages = resources.load_combiner(engine_id, render_default.data["combiner"])
+    stages = resources.render_default_stages(engine_id, render_default)
     if stages is not None:
         return stages
 
@@ -304,7 +304,7 @@ def program_of(engine_id, render_default):
     if render_default is None:
         return None
 
-    key = (engine_id, render_default.name)
+    key = (engine_id, render_default.key)
     if key not in _programs:
         stages = _stages_of(engine_id, render_default)
         _programs[key] = combiner.build_program(stages) if stages else None

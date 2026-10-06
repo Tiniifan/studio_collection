@@ -14,6 +14,9 @@ class RenderDefault:
         self.name = data["name"]
         self.render_program_hash = zlib.crc32(self.name.encode("shift-jis"))
 
+        # The programs built from a render default are cached on this key, a render default of an archive gives its content
+        self.key = data.get("key", self.name)
+
     def __repr__(self):
         return f"RenderDefault({self.engine_id}, {self.name})"
 
@@ -65,6 +68,21 @@ def find_render_default(engine_id, name):
 
 def find_render_default_by_hash(engine_id, render_program_hash):
     return get_engine_data(engine_id).by_hash.get(render_program_hash)
+
+
+def find_vertex_program_skinned(engine_id, vertex_program):
+    """Whether the engine render defaults that use a vertex program are skinned, None when none uses it."""
+    for render_default in get_engine_data(engine_id).defaults.values():
+        if render_default.data["vertex_program"] == vertex_program:
+            return render_default.data.get("skinned")
+    return None
+
+
+def find_combiner_fragment_lighting(engine_id, combiner):
+    for render_default in get_engine_data(engine_id).defaults.values():
+        if render_default.data["combiner"] == combiner:
+            return render_default.data.get("fragment_lighting")
+    return None
 
 
 def resolve_render_default(engine_id, current_name):

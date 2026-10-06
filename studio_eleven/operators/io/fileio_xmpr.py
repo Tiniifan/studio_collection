@@ -304,7 +304,7 @@ def apply_bind_offsets(model_data, bones, bind_offsets):
         lengths[lengths == 0.0] = 1.0
         vertices["normals"] = (normals / lengths).tolist()
 
-def make_mesh(model_data, armature=None, bones=None, lib=None, txp_data=None, atr_state=None, mtr_material=None, bind_offsets=None):
+def make_mesh(model_data, armature=None, bones=None, lib=None, txp_data=None, atr_state=None, mtr_material=None, bind_offsets=None, shaders=None):
     if bind_offsets and bones and model_data["node_table"] and model_data["single_bind"] is None:
         apply_bind_offsets(model_data, bones, bind_offsets)
 
@@ -333,7 +333,7 @@ def make_mesh(model_data, armature=None, bones=None, lib=None, txp_data=None, at
     
     mesh.level5_properties.draw_priority = draw_priority
     mesh.level5_properties.mesh_type = MESH_TYPE_INT_TO_ENUM.get(mesh_type, 'UNK')
-    rendering_project.assign_imported_render_program(mesh, model_data["render_program_hash"])
+    rendering_project.assign_imported_render_program(mesh, model_data["render_program_hash"], shaders=shaders)
     
     mesh.from_pydata(positions, [], model_data["triangles"])  
     

@@ -47,6 +47,15 @@ def load_combiner(engine_id, name):
     return _cached(engine_id, ("combiner", name), build)
 
 
+def render_default_stages(engine_id, render_default):
+    """The combiner of a render default: the one its archive holds, the one of the game otherwise."""
+    stages = render_default.data.get("stages")
+    if stages is not None:
+        return [cmb.CombinerStage.from_dict(stage) for stage in stages]
+
+    return load_combiner(engine_id, render_default.data["combiner"])
+
+
 def load_lut(engine_id, name):
     """Returns the Lut of a shipped fragment lighting table, or None."""
     def build():

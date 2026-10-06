@@ -9,7 +9,7 @@ from ...templates import TEMPLATES
 ##########################################
 
 def get_render_default_choice(self):
-    names = [item[0] for item in rendering_project.render_default_items()]
+    names = [item[0] for item in rendering_project.mesh_render_default_items(self.id_data)]
 
     if self.render_default in names:
         return names.index(self.render_default)
@@ -17,11 +17,14 @@ def get_render_default_choice(self):
     return 0
 
 def set_render_default_choice(self, value):
-    self.render_default = rendering_project.render_default_items()[value][0]
-    self.unresolved_render_program = ""
+    rendering_project.set_mesh_render_default(self.id_data, rendering_project.mesh_render_default_items(self.id_data)[value][0])
 
 def render_default_choice_items(self, context):
-    return rendering_project.render_default_items()
+    # The custom shaders of the blend come first
+    return rendering_project.mesh_render_default_items(self.id_data)
+
+def poll_shader(self, tree):
+    return tree.bl_idname == "Level5ShaderTree"
 
 def get_program_name(render_program):
     """Name of a render program hash (hexadecimal) when a template uses it, the hash otherwise."""
@@ -44,10 +47,17 @@ class Level5MeshProperties(bpy.types.PropertyGroup):
 
     render_default_choice: EnumProperty(
         name="Render Default",
-        description="Render program of the mesh, the ones of the game engine of the project are listed",
+        description="Render program of the mesh, the custom shaders of the blend then the render defaults of the game engine of the project",
         items=render_default_choice_items,
         get=get_render_default_choice,
         set=set_render_default_choice
+    )
+
+    shader: PointerProperty(
+        name="Shader",
+        description="Custom shader of the mesh (Shader Editor), written in the render library of its archive at the export",
+        type=bpy.types.NodeTree,
+        poll=poll_shader
     )
 
     unresolved_render_program: StringProperty(
@@ -92,7 +102,10 @@ class Level5_Panel(bpy.types.Panel):
         if hasattr(mesh, "level5_properties"):
             properties = mesh.level5_properties
 
-            layout.prop(properties, "render_default_choice")
+            row = layout.row(align=True)
+            row.prop(properties, "render_default_choice")
+            if properties.shader is not None:
+                row.operator("studio_eleven.edit_mesh_shader", text="", icon='NODE_MATERIAL')
 
             if properties.unresolved_render_program:
                 layout.label(text=f"Program {get_program_name(properties.unresolved_render_program)} is kept on export", icon='INFO')

@@ -61,6 +61,9 @@ def register():
     # Level 5 Mesh Panel
     register_mesh_properties()
 
+    # Custom shaders of the blend (Shader Editor)
+    register_shader_editor()
+
     # Level 5 Material Panel
     register_material_render()
 
@@ -93,6 +96,9 @@ def unregister():
 
     # Level 5 Material Panel
     unregister_material_render()
+
+    # Custom shaders of the blend
+    unregister_shader_editor()
 
     # Level 5 Mesh Panel
     unregister_mesh_properties()
