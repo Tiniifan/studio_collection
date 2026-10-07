@@ -1,12 +1,15 @@
-"""The combiner of a custom shader written as code: a small GLSL that compiles to the stages of the texture combiner and back.
+"""The FRAGMENT_SHADER section of a custom shader: GLSL that compiles to the stages of the texture combiner and back.
 
-    vec3 lit = (light_diffuse + light_specular) * texture0;
-    color = lit * vertex_color * 2.0;
-    alpha = texture0.a * vertex_color.a * 2.0;
+    void main() {
+        vec4 tex0 = texture2D(unf_frg_txt_2d_0, var_tx0.xy);
+        vec3 lit = (clr_1st.rgb + clr_2nd.rgb) * tex0.rgb;
+        gl_FragColor = vec4(lit * var_clr.rgb * 2.0, tex0.a * var_clr.a * 2.0);
+    }
 
-Every operation clamps its result to 0..1 like the hardware, so the code computes what the game draws.
+The code is read lane by lane (rgb and alpha) into a program of the source names below, every operation clamps its result
+to 0..1 like the hardware, so the code computes what the game draws.
 """
-import re
+from .shader_code import CodeError
 
 ##########################################
 # CONST
@@ -58,180 +61,527 @@ RGB_OPERANDS = {
 
 OPERAND_SELECTS = {v: k for k, v in RGB_OPERANDS.items()}
 
-TOKEN_PATTERN = re.compile(r"\s*(?:(//[^\n]*|/\*.*?\*/)|(\d+\.\d*|\.\d+|\d+)|([A-Za-z_][A-Za-z_0-9]*)|(.))", re.S)
+# Names of the FRAGMENT_SHADER section -> name of the source in the program
+FRAGMENT_INPUTS = {
+    "var_clr": "vertex_color",
+    "clr_1st": "light_diffuse",
+    "clr_2nd": "light_specular",
+}
 
-class CodeError(Exception):
-    pass
+FRAGMENT_SAMPLERS = {
+    "unf_frg_txt_2d_0": 0,
+    "unf_frg_txt_2d_1": 1,
+    "unf_frg_txt_2d_2": 2,
+}
+
+TEXTURE_COORDINATES = {
+    "var_tx0": 0,
+    "var_tx1": 1,
+    "var_tx2": 2,
+}
+
+# The hardware reads texture N at the texture coordinates N
+TEXTURE_UNIT_COORDINATES = {v: k for k, v in TEXTURE_COORDINATES.items()}
+
+# Source of a stage -> name in the FRAGMENT_SHADER section
+SOURCE_GLSL = {
+    "TEXTURE0": "tex0",
+    "TEXTURE1": "tex1",
+    "TEXTURE2": "tex2",
+    "PRIMARY_COLOR": "var_clr",
+    "FRAGMENT_PRIMARY_COLOR": "clr_1st",
+    "FRAGMENT_SECONDARY_COLOR": "clr_2nd",
+}
 
 ##########################################
-# Parser
+# Fragment section (code -> program)
 ##########################################
 
-def tokenize(text):
-    tokens = []
-    line = 1
-    position = 0
+class FragmentReader:
+    """Runs the FRAGMENT_SHADER section on the lanes of the combiner: a vec4 is an rgb expression and an alpha expression."""
 
-    while position < len(text):
-        match = TOKEN_PATTERN.match(text, position)
-        if match is None:
-            break
+    def __init__(self, tree):
+        self.tree = tree
+        self.scopes = [{}]
+        self.variables = []
+        self.names = set()
+        self.output = {"rgb": None, "a": None}
+        self.returned = None
+        self.call_depth = 0
 
-        line += text.count("\n", position, match.start(0) + len(match.group(0)) - len(match.group(0).lstrip()))
+    def error(self, message, line):
+        raise CodeError(message, line)
 
-        comment, number, name, symbol = match.groups()
-        if number is not None:
-            tokens.append(("number", float(number), line))
-        elif name is not None:
-            tokens.append(("name", name, line))
-        elif symbol is not None and not symbol.isspace():
-            tokens.append(("symbol", symbol, line))
+    def read(self):
+        for declaration in self.tree["declarations"]:
+            self.declare_global(declaration)
 
-        if comment is not None:
-            line += comment.count("\n")
+        if "main" not in self.tree["functions"]:
+            raise CodeError("The FRAGMENT_SHADER section has no main function")
 
-        position = match.end(0)
+        self.call_function(self.tree["functions"]["main"], [], self.tree["functions"]["main"]["line"])
 
-    tokens.append(("end", None, line))
+        if self.output["rgb"] is None:
+            raise CodeError("The fragment shader must write gl_FragColor")
 
-    return tokens
+        alpha = self.output["a"]
+        if alpha is None:
+            alpha = {"type": "number", "value": 1.0}
 
-class Parser:
-    def __init__(self, text):
-        self.tokens = tokenize(text)
-        self.index = 0
+        return {"variables": self.variables, "color": self.output["rgb"], "alpha": alpha}
 
-    def peek(self):
-        return self.tokens[self.index]
+    def declare_global(self, declaration):
+        name = declaration["name"]
+        line = declaration["line"]
 
-    def next(self):
-        token = self.tokens[self.index]
-        self.index += 1
-        return token
+        if name in FRAGMENT_SAMPLERS or name in FRAGMENT_INPUTS or name in TEXTURE_COORDINATES:
+            return
 
-    def expect(self, value):
-        token = self.next()
-        if token[1] != value:
-            raise CodeError(f"Line {token[2]}: '{value}' expected, found '{token[1]}'")
-        return token
+        if "uniform" in declaration["qualifiers"] or "varying" in declaration["qualifiers"] or "in" in declaration["qualifiers"]:
+            self.error(f"The combiner can't read {name}: textures {', '.join(FRAGMENT_SAMPLERS)}, colors var_clr, clr_1st, clr_2nd", line)
 
-    def parse_program(self):
-        program = {"variables": [], "color": None, "alpha": None}
-        names = {}
+        self.declare_local(declaration)
 
-        while self.peek()[0] != "end":
-            token = self.next()
-            if token[0] != "name":
-                raise CodeError(f"Line {token[2]}: a statement starts with a name, found '{token[1]}'")
+    def lookup(self, name, line):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
 
-            declared = None
-            if token[1] in ("vec3", "float"):
-                declared = token[1]
-                token = self.next()
-                if token[0] != "name":
-                    raise CodeError(f"Line {token[2]}: a variable name is expected after {declared}")
+        if name in FRAGMENT_INPUTS:
+            source = {"type": "name", "name": FRAGMENT_INPUTS[name], "line": line}
+            return {"type": "vec4", "rgb": source, "a": {"type": "swizzle", "argument": source, "swizzle": "a"}}
 
-            name = token[1]
-            line = token[2]
-            self.expect("=")
-            expression = self.parse_expression()
-            self.expect(";")
+        if name in FRAGMENT_SAMPLERS:
+            return {"type": "sampler2D", "unit": FRAGMENT_SAMPLERS[name]}
 
-            if name in ("color", "alpha"):
-                program[name] = expression
-            elif name in SOURCE_NAMES:
-                raise CodeError(f"Line {line}: {name} is an input of the combiner, it can't be assigned")
+        if name in TEXTURE_COORDINATES:
+            return {"type": "coordinates", "unit": TEXTURE_COORDINATES[name]}
+
+        if name == "gl_FragColor":
+            return {"type": "output"}
+
+        self.error(f"Unknown name {name}", line)
+
+    def declare_local(self, declaration):
+        line = declaration["line"]
+        value_type = declaration["type"]
+
+        if value_type not in ("vec4", "vec3", "float"):
+            self.error(f"The combiner only works on vec4, vec3 and float values, not {value_type}", line)
+        if declaration["size"] is not None:
+            self.error("The combiner has no arrays", line)
+
+        if declaration["value"] is None:
+            value = self.make_number_value(value_type, 0.0)
+        else:
+            value = self.convert(self.evaluate(declaration["value"]), value_type, line)
+
+        self.scopes[-1][declaration["name"]] = self.name_value(declaration["name"], value)
+
+    def make_number_value(self, value_type, number):
+        constant = {"type": "number", "value": number}
+        if value_type == "float":
+            return {"type": "float", "value": constant}
+        if value_type == "vec3":
+            return {"type": "vec3", "rgb": constant}
+        return {"type": "vec4", "rgb": constant, "a": constant}
+
+    def name_value(self, name, value):
+        """A computed lane becomes a variable of the program, so the stages compute it once."""
+        result = dict(value)
+
+        for lane in ("rgb", "a", "value"):
+            expression = value.get(lane)
+            if expression is None or is_simple(expression):
+                continue
+
+            variable = name
+            if lane == "a" and value["type"] == "vec4":
+                variable = f"{name}_a"
+
+            unique = variable
+            count = 1
+            while unique in self.names or unique in SOURCE_NAMES:
+                count += 1
+                unique = f"{variable}_{count}"
+
+            self.names.add(unique)
+            declared = "float"
+            if lane == "rgb":
+                declared = "vec3"
+            self.variables.append({"name": unique, "type": declared, "expression": expression})
+            result[lane] = {"type": "name", "name": unique, "line": 0}
+
+        return result
+
+    def convert(self, value, value_type, line):
+        if value["type"] == value_type:
+            return value
+
+        if value["type"] == "float" and value_type in ("vec3", "vec4"):
+            rgb = value["value"]
+            # A number given to a color is a gray constant, a color of the combiner
+            if rgb["type"] == "number":
+                rgb = {"type": "vector", "values": [rgb["value"]] * 3}
+            result = {"type": value_type, "rgb": rgb}
+            if value_type == "vec4":
+                result["a"] = value["value"]
+            return result
+
+        self.error(f"A {value['type']} can't be given to a {value_type}", line)
+
+    def get_lane(self, value, lane, line):
+        if value["type"] == "float":
+            return value["value"]
+        if value["type"] not in ("vec3", "vec4"):
+            self.error(f"A {value['type']} can't be used in a computation", line)
+        if lane == "a" and value["type"] == "vec3":
+            self.error("A vec3 has no alpha", line)
+        return value[lane]
+
+    ##########################################
+    # Statements
+    ##########################################
+
+    def execute_block(self, statements):
+        for statement in statements:
+            self.execute(statement)
+            if self.returned is not None:
+                return
+
+    def execute(self, statement):
+        kind = statement["kind"]
+        line = statement["line"]
+
+        if kind == "declare":
+            self.declare_local(statement)
+        elif kind == "expression":
+            self.evaluate(statement["value"])
+        elif kind == "block":
+            self.scopes.append({})
+            self.execute_block(statement["body"])
+            self.scopes.pop()
+        elif kind == "return":
+            value = None
+            if statement["value"] is not None:
+                value = self.evaluate(statement["value"])
+            self.returned = {"value": value}
+        elif kind in ("if", "for"):
+            self.error(f"The combiner has no '{kind}': every pixel runs the same stages", line)
+        else:
+            self.error(f"Unknown statement {kind}", line)
+
+    def call_function(self, function, arguments, line):
+        if self.call_depth > 16:
+            self.error(f"{function['name']} calls itself, a shader can't", line)
+
+        if len(arguments) != len(function["parameters"]):
+            self.error(f"{function['name']} takes {len(function['parameters'])} arguments", line)
+
+        scope = {}
+        for index, parameter in enumerate(function["parameters"]):
+            scope[parameter["name"]] = self.convert(arguments[index], parameter["type"], line)
+
+        saved_scopes = self.scopes
+        saved_returned = self.returned
+        self.scopes = [self.scopes[0], scope]
+        self.returned = None
+        self.call_depth += 1
+
+        self.execute_block(function["body"])
+
+        result = self.returned
+        self.call_depth -= 1
+        self.scopes = saved_scopes
+        self.returned = saved_returned
+
+        if function["type"] == "void":
+            return {"type": "void"}
+
+        if result is None or result["value"] is None:
+            self.error(f"{function['name']} doesn't return a value", function["line"])
+
+        return self.convert(result["value"], function["type"], line)
+
+    ##########################################
+    # Expressions
+    ##########################################
+
+    def evaluate(self, expression):
+        kind = expression["kind"]
+        line = expression["line"]
+
+        if kind == "number":
+            return {"type": "float", "value": {"type": "number", "value": expression["value"]}}
+
+        if kind == "name":
+            return self.lookup(expression["name"], line)
+
+        if kind == "binary":
+            left = self.evaluate(expression["left"])
+            right = self.evaluate(expression["right"])
+            return self.combine_values(expression["operator"], left, right, line)
+
+        if kind == "unary":
+            if expression["operator"] != "-":
+                self.error(f"The combiner has no '{expression['operator']}'", line)
+            zero = {"type": "float", "value": {"type": "number", "value": 0.0}}
+            return self.combine_values("-", zero, self.evaluate(expression["operand"]), line)
+
+        if kind == "swizzle":
+            return self.evaluate_swizzle(self.evaluate(expression["operand"]), expression["components"], line)
+
+        if kind == "assign":
+            return self.evaluate_assign(expression)
+
+        if kind == "call":
+            return self.evaluate_call(expression)
+
+        self.error(f"The combiner can't compute a {kind}", line)
+
+    def combine_values(self, operator, left, right, line):
+        if operator == "/":
+            if right["type"] != "float" or right["value"]["type"] != "number" or right["value"]["value"] == 0.0:
+                self.error("The combiner only divides by a number", line)
+            right = {"type": "float", "value": {"type": "number", "value": 1.0 / right["value"]["value"]}}
+            operator = "*"
+
+        if operator not in ("+", "-", "*"):
+            self.error(f"The combiner has no '{operator}'", line)
+
+        value_type = left["type"]
+        if right["type"] != "float":
+            value_type = right["type"]
+        if left["type"] != "float" and right["type"] != "float" and left["type"] != right["type"]:
+            self.error(f"{left['type']} {operator} {right['type']}: the sizes don't match", line)
+
+        if value_type == "float":
+            return {"type": "float", "value": fold_binary(operator, left["value"], right["value"])}
+
+        result = {"type": value_type}
+        lanes = ["rgb"]
+        if value_type == "vec4":
+            lanes.append("a")
+        for lane in lanes:
+            result[lane] = fold_binary(operator, self.get_lane(left, lane, line), self.get_lane(right, lane, line))
+
+        return result
+
+    def evaluate_swizzle(self, value, components, line):
+        if value["type"] not in ("vec3", "vec4", "float"):
+            self.error(f"A {value['type']} has no components", line)
+
+        letters = components
+        for letter_set, mapped in (("xyzw", "rgba"), ("stpq", "rgba")):
+            if all(letter in letter_set for letter in letters):
+                letters = "".join(mapped[letter_set.index(letter)] for letter in letters)
+
+        if value["type"] == "float":
+            if letters != "r":
+                self.error(f"A float has no '.{components}'", line)
+            return value
+
+        if letters == "rgba" and value["type"] == "vec4":
+            return value
+        if letters == "rgb":
+            return {"type": "vec3", "rgb": value["rgb"]}
+        if letters == "a":
+            return {"type": "float", "value": self.get_lane(value, "a", line)}
+        if letters in ("r", "g", "b"):
+            return {"type": "float", "value": {"type": "swizzle", "argument": value["rgb"], "swizzle": letters}}
+        if len(letters) == 3 and len(set(letters)) == 1 and letters[0] in "rgb":
+            return {"type": "vec3", "rgb": {"type": "swizzle", "argument": value["rgb"], "swizzle": letters[0]}}
+
+        self.error(f"The combiner reads .rgb, .a, .r, .g or .b, not '.{components}'", line)
+
+    def evaluate_assign(self, expression):
+        line = expression["line"]
+        target = expression["target"]
+        value = self.evaluate(expression["value"])
+
+        if expression["operator"] != "=":
+            current = self.evaluate(target)
+            value = self.combine_values(expression["operator"][0], current, value, line)
+
+        if target["kind"] == "name" and target["name"] == "gl_FragColor":
+            value = self.convert(value, "vec4", line)
+            self.output["rgb"] = value["rgb"]
+            self.output["a"] = value["a"]
+            return value
+
+        if target["kind"] == "swizzle" and target["operand"]["kind"] == "name" and target["operand"]["name"] == "gl_FragColor":
+            letters = target["components"].replace("x", "r").replace("y", "g").replace("z", "b").replace("w", "a")
+            if letters == "rgb":
+                self.output["rgb"] = self.convert(value, "vec3", line)["rgb"]
+            elif letters == "a":
+                if value["type"] != "float":
+                    self.error("gl_FragColor.a takes a float", line)
+                self.output["a"] = value["value"]
+            elif letters == "rgba":
+                self.assign_output(value, line)
             else:
-                if name in names:
-                    raise CodeError(f"Line {line}: {name} is already defined")
-                names[name] = expression
-                program["variables"].append({"name": name, "type": declared, "expression": expression})
+                self.error("Write gl_FragColor, gl_FragColor.rgb or gl_FragColor.a", line)
+            return value
 
-        if program["color"] is None:
-            raise CodeError("The code must assign color")
+        if target["kind"] != "name":
+            self.error("The combiner can only write a whole variable or gl_FragColor", line)
 
-        if program["alpha"] is None:
-            program["alpha"] = {"type": "number", "value": 1.0}
+        name = target["name"]
+        current = self.lookup(name, line)
+        if current["type"] in ("sampler2D", "coordinates") or name in FRAGMENT_INPUTS:
+            self.error(f"{name} is an input, it can't be written", line)
 
-        check_names(program)
+        value = self.convert(value, current["type"], line)
+        named = self.name_value(name, value)
 
-        return program
+        for scope in reversed(self.scopes):
+            if name in scope:
+                scope[name] = named
+                break
 
-    def parse_expression(self):
-        left = self.parse_term()
+        return named
 
-        while self.peek()[1] in ("+", "-"):
-            operator = self.next()[1]
-            left = {"type": "binary", "operator": operator, "left": left, "right": self.parse_term()}
+    def assign_output(self, value, line):
+        value = self.convert(value, "vec4", line)
+        self.output["rgb"] = value["rgb"]
+        self.output["a"] = value["a"]
 
-        return left
+    def evaluate_call(self, expression):
+        line = expression["line"]
+        name = expression["name"]
 
-    def parse_term(self):
-        left = self.parse_postfix()
+        # dot3 / add_signed may be defined in the code to keep it valid GLSL, the combiner has them
+        if name in self.tree["functions"] and name not in ("dot3", "add_signed"):
+            arguments = [self.evaluate(argument) for argument in expression["arguments"]]
+            return self.call_function(self.tree["functions"][name], arguments, line)
 
-        while self.peek()[1] == "*":
-            self.next()
-            left = {"type": "binary", "operator": "*", "left": left, "right": self.parse_postfix()}
+        if name in ("texture2D", "texture"):
+            return self.sample(expression)
 
-        return left
+        arguments = [self.evaluate(argument) for argument in expression["arguments"]]
 
-    def parse_postfix(self):
-        expression = self.parse_primary()
+        if name in ("vec3", "vec4", "float"):
+            return self.construct(name, arguments, line)
 
-        while self.peek()[1] == ".":
-            self.next()
-            token = self.next()
-            if token[1] not in SWIZZLES:
-                raise CodeError(f"Line {token[2]}: .{token[1]} is not a channel, use .rgb .a .r .g or .b")
-            expression = {"type": "swizzle", "argument": expression, "swizzle": token[1]}
+        if name == "mix":
+            if len(arguments) != 3:
+                self.error("mix takes 3 arguments", line)
+            return self.lanes_call("mix", arguments, line)
 
-        return expression
+        if name == "add_signed":
+            if len(arguments) != 2:
+                self.error("add_signed takes 2 arguments", line)
+            return self.lanes_call("add_signed", arguments, line)
 
-    def parse_primary(self):
-        token = self.next()
+        if name == "dot3":
+            if len(arguments) != 2:
+                self.error("dot3 takes 2 arguments", line)
+            rgb = {"type": "call", "name": "dot3", "arguments": [self.get_lane(arguments[0], "rgb", line), self.get_lane(arguments[1], "rgb", line)]}
+            return {"type": "vec3", "rgb": rgb}
 
-        if token[0] == "number":
-            return {"type": "number", "value": token[1]}
+        if name == "clamp":
+            if len(arguments) != 3 or not is_number_value(arguments[1], 0.0) or not is_number_value(arguments[2], 1.0):
+                self.error("The combiner only clamps to 0.0 .. 1.0, which it always does", line)
+            return arguments[0]
 
-        if token[1] == "(":
-            expression = self.parse_expression()
-            self.expect(")")
-            return expression
+        self.error(f"The combiner has no {name}: it knows texture2D, mix, dot3, add_signed and clamp(x, 0.0, 1.0)", line)
 
-        if token[0] != "name":
-            raise CodeError(f"Line {token[2]}: unexpected '{token[1]}'")
+    def lanes_call(self, name, arguments, line):
+        value_type = "float"
+        for argument in arguments[:2]:
+            if argument["type"] != "float":
+                value_type = argument["type"]
 
-        if self.peek()[1] != "(":
-            return {"type": "name", "name": token[1], "line": token[2]}
+        if value_type == "float":
+            return {"type": "float", "value": {"type": "call", "name": name, "arguments": [argument["value"] for argument in arguments]}}
 
-        self.next()
-        arguments = []
-        if self.peek()[1] != ")":
-            arguments.append(self.parse_expression())
-            while self.peek()[1] == ",":
-                self.next()
-                arguments.append(self.parse_expression())
-        self.expect(")")
+        result = {"type": value_type}
+        lanes = ["rgb"]
+        if value_type == "vec4":
+            lanes.append("a")
+        for lane in lanes:
+            result[lane] = {"type": "call", "name": name, "arguments": [self.get_lane(argument, lane, line) for argument in arguments]}
 
-        if token[1] == "vec3":
-            values = []
-            for argument in arguments:
-                if argument["type"] != "number":
-                    raise CodeError(f"Line {token[2]}: vec3 only takes numbers, the color of a constant")
-                values.append(argument["value"])
-            if len(values) == 1:
-                values = values * 3
-            if len(values) != 3:
-                raise CodeError(f"Line {token[2]}: vec3 takes 1 or 3 numbers")
-            return {"type": "vector", "values": values}
+        return result
 
-        arity = {"mix": 3, "dot3": 2, "add_signed": 2}
-        if token[1] not in arity:
-            raise CodeError(f"Line {token[2]}: unknown function {token[1]}, the combiner knows mix, dot3 and add_signed")
-        if len(arguments) != arity[token[1]]:
-            raise CodeError(f"Line {token[2]}: {token[1]} takes {arity[token[1]]} arguments")
+    def sample(self, expression):
+        line = expression["line"]
+        arguments = expression["arguments"]
 
-        return {"type": "call", "name": token[1], "arguments": arguments}
+        if len(arguments) != 2 or arguments[0]["kind"] != "name":
+            self.error("texture2D(unf_frg_txt_2d_N, var_txN.xy) expected", line)
+
+        sampler = self.lookup(arguments[0]["name"], line)
+        if sampler["type"] != "sampler2D":
+            self.error(f"{arguments[0]['name']} is not a texture, use {', '.join(FRAGMENT_SAMPLERS)}", line)
+
+        coordinates = arguments[1]
+        while coordinates["kind"] == "swizzle":
+            coordinates = coordinates["operand"]
+
+        unit = sampler["unit"]
+        expected = TEXTURE_UNIT_COORDINATES[unit]
+        if coordinates["kind"] != "name" or coordinates["name"] != expected:
+            self.error(f"Texture {unit} is read at {expected} by the hardware: texture2D({arguments[0]['name']}, {expected}.xy)", line)
+
+        source = {"type": "name", "name": f"texture{unit}", "line": line}
+
+        return {"type": "vec4", "rgb": source, "a": {"type": "swizzle", "argument": source, "swizzle": "a"}}
+
+    def construct(self, name, arguments, line):
+        if name == "float":
+            if len(arguments) != 1 or arguments[0]["type"] != "float":
+                self.error("float() takes one float", line)
+            return arguments[0]
+
+        if len(arguments) == 1:
+            return self.convert(arguments[0], name, line)
+
+        numbers = []
+        for argument in arguments:
+            if argument["type"] == "float" and argument["value"]["type"] == "number":
+                numbers.append(argument["value"]["value"])
+            else:
+                numbers = None
+                break
+
+        if numbers is not None and name == "vec3" and len(numbers) == 3:
+            return {"type": "vec3", "rgb": {"type": "vector", "values": numbers}}
+
+        if numbers is not None and name == "vec4" and len(numbers) == 4:
+            return {"type": "vec4", "rgb": {"type": "vector", "values": numbers[:3]}, "a": {"type": "number", "value": numbers[3]}}
+
+        if name == "vec4" and len(arguments) == 2 and arguments[0]["type"] == "vec3" and arguments[1]["type"] == "float":
+            return {"type": "vec4", "rgb": arguments[0]["rgb"], "a": arguments[1]["value"]}
+
+        self.error(f"{name}: the combiner builds a color from one value, three numbers, or vec4(vec3, float)", line)
+
+def is_simple(expression):
+    if expression["type"] in ("number", "vector", "name"):
+        return True
+    return expression["type"] == "swizzle" and expression["argument"]["type"] == "name"
+
+def is_number_value(value, number):
+    return value["type"] == "float" and value["value"]["type"] == "number" and abs(value["value"]["value"] - number) < 1e-6
+
+def fold_binary(operator, left, right):
+    if left["type"] == "number" and right["type"] == "number":
+        if operator == "+":
+            return {"type": "number", "value": left["value"] + right["value"]}
+        if operator == "-":
+            return {"type": "number", "value": left["value"] - right["value"]}
+        return {"type": "number", "value": left["value"] * right["value"]}
+
+    return {"type": "binary", "operator": operator, "left": left, "right": right}
+
+def read_fragment(tree):
+    """The program (variables, color, alpha) of a parsed FRAGMENT_SHADER section."""
+    program = FragmentReader(tree).read()
+    check_names(program)
+    return program
+
+def compile_fragment(tree):
+    return compile_program(read_fragment(tree))
 
 def walk_names(expression, found):
     if expression["type"] == "name":
@@ -262,9 +612,6 @@ def check_names(program):
         for name in found:
             if name["name"] not in known:
                 raise CodeError(f"Line {name['line']}: {name['name']} is not defined")
-
-def parse_code(text):
-    return Parser(text).parse_program()
 
 ##########################################
 # Types
@@ -374,7 +721,8 @@ class Lowering:
         if kind == "name" and expression["name"] in SOURCE_NAMES:
             if select is None:
                 if lane == "alpha":
-                    raise CodeError(f"{expression['name']} is a color, the alpha reads one channel of it: {expression['name']}.a")
+                    code_name = SOURCE_GLSL.get(SOURCE_NAMES[expression["name"]], expression["name"])
+                    raise CodeError(f"{code_name}.rgb is a color, the alpha reads one channel of it: {code_name}.a")
                 select = "rgb"
             return {"kind": "source", "source": SOURCE_NAMES[expression["name"]], "select": select, "invert": False}
 
@@ -868,9 +1216,6 @@ def compile_program(program):
     scheduled, buffer_color = Scheduler(nodes, color, alpha).schedule()
     return emit_stages(scheduled, buffer_color)
 
-def compile_code(text):
-    return compile_program(parse_code(text))
-
 ##########################################
 # Decompiler (stages -> code)
 ##########################################
@@ -986,12 +1331,16 @@ def format_vector(values):
     return "vec3(" + ", ".join(format_number(value) for value in values) + ")"
 
 class Writer:
+    """The stages as the FRAGMENT_SHADER section of a custom shader."""
+
     def __init__(self, decompiled):
         self.nodes = decompiled["nodes"]
         self.decompiled = decompiled
         self.uses = {}
         self.names = {}
         self.lines = []
+        self.sources = set()
+        self.helpers = set()
 
         for node in self.nodes:
             self.uses[node["id"]] = 0
@@ -1005,6 +1354,12 @@ class Writer:
         if argument is not None and argument["kind"] == "node":
             self.uses[argument["node"]] += 1
 
+    def is_color(self, argument):
+        """Whether an argument is a vec3 in the code, the other ones are floats."""
+        if argument["kind"] == "node":
+            return self.nodes[argument["node"]]["lane"] == "rgb" and argument["select"] == "rgb"
+        return argument["select"] == "rgb"
+
     def argument(self, argument):
         """The code of an argument and its priority, inverted with 1.0 - x."""
         if argument["kind"] == "constant":
@@ -1013,11 +1368,11 @@ class Writer:
             else:
                 written = (format_number(argument["value"]), ATOM)
         elif argument["kind"] == "source":
-            name = SOURCE_CODE_NAMES[argument["source"]]
-            if argument["select"] == "rgb":
-                written = (name, ATOM)
-            else:
-                written = (f"{name}.{argument['select']}", ATOM)
+            if argument["source"] not in SOURCE_GLSL:
+                raise CodeError(f"The source {argument['source']} can't be written as code")
+            self.sources.add(argument["source"])
+            name = SOURCE_GLSL[argument["source"]]
+            written = (f"{name}.{argument['select']}", ATOM)
         else:
             written = self.node(self.nodes[argument["node"]])
             if argument["select"] in ("r", "g", "b"):
@@ -1042,11 +1397,18 @@ class Writer:
             else:
                 name = f"value{len(self.names)}"
                 declared = "float"
-            self.lines.append(f"{declared} {name} = {written[0]};")
+            self.lines.append(f"    {declared} {name} = {written[0]};")
             self.names[node["id"]] = name
             return (name, ATOM)
 
         return written
+
+    def call_argument(self, node, argument):
+        """A float given to a function of the rgb lane is written vec3(x), so the code stays valid GLSL."""
+        written = self.argument(argument)
+        if node["lane"] == "rgb" and not self.is_color(argument):
+            return f"vec3({written[0]})"
+        return written[0]
 
     def expression(self, node):
         a = [self.argument(argument) for argument in node["arguments"]]
@@ -1061,11 +1423,15 @@ class Writer:
         elif function == "SUBTRACT":
             written = (f"{wrap(a[0], SUM)} - {wrap(a[1], PRODUCT)}", SUM)
         elif function == "ADD_SIGNED":
-            written = (f"add_signed({a[0][0]}, {a[1][0]})", ATOM)
+            self.helpers.add("add_signed")
+            written = (f"add_signed({self.call_argument(node, node['arguments'][0])}, {self.call_argument(node, node['arguments'][1])})", ATOM)
         elif function == "DOT3_RGB":
-            written = (f"dot3({a[0][0]}, {a[1][0]})", ATOM)
+            self.helpers.add("dot3")
+            written = (f"dot3({self.call_argument(node, node['arguments'][0])}, {self.call_argument(node, node['arguments'][1])})", ATOM)
         elif function == "INTERPOLATE":
-            written = (f"mix({a[1][0]}, {a[0][0]}, {a[2][0]})", ATOM)
+            first = self.call_argument(node, node["arguments"][1])
+            second = self.call_argument(node, node["arguments"][0])
+            written = (f"mix({first}, {second}, {a[2][0]})", ATOM)
         elif function == "ADD_MULT":
             written = (f"({wrap(a[0], SUM)} + {wrap(a[1], PRODUCT)}) * {wrap(a[2], ATOM)}", PRODUCT)
         else:
@@ -1077,59 +1443,63 @@ class Writer:
         return written
 
     def write(self):
-        alpha = self.argument(self.decompiled["alpha"])
-        color = self.argument(self.decompiled["color"])
+        alpha = self.argument(self.decompiled["alpha"])[0]
+        color = self.argument(self.decompiled["color"])[0]
+        if not self.is_color(self.decompiled["color"]):
+            color = f"vec3({color})"
 
-        lines = list(self.lines)
-        lines.append(f"color = {color[0]};")
-        lines.append(f"alpha = {alpha[0]};")
+        lines = ["#ifdef FRAGMENT_SHADER"]
+
+        for source in ("TEXTURE0", "TEXTURE1", "TEXTURE2"):
+            if source in self.sources:
+                lines.append(f"uniform sampler2D unf_frg_txt_2d_{source[-1]};")
+
+        varyings = []
+        if "PRIMARY_COLOR" in self.sources:
+            varyings.append("var_clr")
+        for source in ("TEXTURE0", "TEXTURE1", "TEXTURE2"):
+            if source in self.sources:
+                varyings.append(f"var_tx{source[-1]}")
+        for name in varyings:
+            lines.append(f"varying vec4 {name};")
+
+        if "FRAGMENT_PRIMARY_COLOR" in self.sources or "FRAGMENT_SECONDARY_COLOR" in self.sources:
+            lines.append("// Lighting of the material (.mtr), computed by the hardware: diffuse and specular")
+            lines.append("varying vec4 clr_1st;")
+            lines.append("varying vec4 clr_2nd;")
+
+        if "dot3" in self.helpers:
+            lines.append("")
+            lines.append("// Stages of the combiner, every result is clamped to 0..1")
+            lines.append("vec3 dot3(vec3 a, vec3 b) { return vec3(4.0 * dot(a - 0.5, b - 0.5)); }")
+        if "add_signed" in self.helpers:
+            if "dot3" not in self.helpers:
+                lines.append("")
+                lines.append("// Stages of the combiner, every result is clamped to 0..1")
+            lines.append("vec3 add_signed(vec3 a, vec3 b) { return a + b - 0.5; }")
+            lines.append("float add_signed(float a, float b) { return a + b - 0.5; }")
+
+        lines.append("")
+        lines.append("void main() {")
+        for source in ("TEXTURE0", "TEXTURE1", "TEXTURE2"):
+            if source in self.sources:
+                unit = source[-1]
+                lines.append(f"    vec4 tex{unit} = texture2D(unf_frg_txt_2d_{unit}, var_tx{unit}.xy);")
+        lines += self.lines
+        lines.append(f"    gl_FragColor = vec4({color}, {alpha});")
+        lines.append("}")
+        lines.append("#endif")
 
         return "\n".join(lines) + "\n"
 
 def decompile_code(stages):
-    """The code of a stage list (dicts of formats/material/cmb.py)."""
+    """The FRAGMENT_SHADER section of a stage list (dicts of formats/material/cmb.py)."""
     return Writer(decompile_stages(stages)).write()
 
-##########################################
-# Program writer (parsed code -> code)
-##########################################
-
-def write_expression(expression):
-    """The code of a parsed expression and its priority."""
-    kind = expression["type"]
-
-    if kind == "number":
-        return (format_number(expression["value"]), ATOM)
-    if kind == "vector":
-        return (format_vector(expression["values"]), ATOM)
-    if kind == "name":
-        return (expression["name"], ATOM)
-    if kind == "swizzle":
-        return (f"{wrap(write_expression(expression['argument']), ATOM)}.{expression['swizzle']}", ATOM)
-    if kind == "call":
-        arguments = ", ".join(write_expression(argument)[0] for argument in expression["arguments"])
-        return (f"{expression['name']}({arguments})", ATOM)
-
-    left = write_expression(expression["left"])
-    right = write_expression(expression["right"])
-
-    if expression["operator"] == "*":
-        return (f"{wrap(left, PRODUCT)} * {wrap(right, ATOM)}", PRODUCT)
-
-    return (f"{wrap(left, SUM)} {expression['operator']} {wrap(right, PRODUCT)}", SUM)
-
-def write_program(program):
-    lines = []
-
-    for variable in program["variables"]:
-        declared = variable["type"]
-        if declared is None:
-            declared = "vec3"
-            if type_of(program, variable["expression"]) == "value":
-                declared = "float"
-        lines.append(f"{declared} {variable['name']} = {write_expression(variable['expression'])[0]};")
-
-    lines.append(f"color = {write_expression(program['color'])[0]};")
-    lines.append(f"alpha = {write_expression(program['alpha'])[0]};")
-
-    return "\n".join(lines) + "\n"
+def uses_palette(stages):
+    """The mask stage of the characters takes its constant from a color of the model, the code can't say that."""
+    for stage in stages:
+        rgb = stage["rgb"]
+        if rgb["source"][:2] == ["CONSTANT", "TEXTURE0"] and rgb["operand"][1] in ("SRC_R", "SRC_G", "SRC_B"):
+            return True
+    return False

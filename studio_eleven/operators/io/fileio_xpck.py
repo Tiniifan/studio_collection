@@ -1163,7 +1163,7 @@ def make_xpck_files(operator, context, engine, mode, meshes = [], armature = Non
                 shaders.append(shader)
 
         try:
-            render_library, render_library_files = custom_shaders.get_library_files(shaders, engine.file_version)
+            render_library, render_library_files = custom_shaders.get_library_files(shaders, engine.file_version, engine.id)
         except ValueError as error:
             raise XpckExportError(str(error))
 

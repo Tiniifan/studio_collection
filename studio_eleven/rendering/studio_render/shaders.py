@@ -399,13 +399,19 @@ def clear_cache():
     _shaders.clear()
 
 
-def get_shader(program, options, program_key):
-    """Builds the GPUShader lazily, calling it without a GPU backend raises."""
+def get_shader(program, options, program_key, vertex=None):
+    """Builds the GPUShader lazily, calling it without a GPU backend raises. vertex is the vertex stage of a custom shader."""
     import gpu
 
     key = (program_key, options.key())
     if key not in _shaders:
         source = outline_fragment_source(options, program) if options.outline else fragment_source(program, options)
-        _shaders[key] = gpu.types.GPUShader(vertex_source(options), source, name="StudioRender")
+
+        # The outline keeps the extrusion of StudioRender, the custom vertex stage draws the mesh
+        vertex_stage = vertex_source(options)
+        if vertex and not options.outline:
+            vertex_stage = vertex
+
+        _shaders[key] = gpu.types.GPUShader(vertex_stage, source, name="StudioRender")
 
     return _shaders[key]

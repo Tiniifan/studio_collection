@@ -1,32 +1,45 @@
 import bpy
-import nodeitems_utils
-from bpy.props import StringProperty, EnumProperty, BoolProperty
-from nodeitems_utils import NodeCategory, NodeItem
+from bpy.props import StringProperty, EnumProperty, BoolProperty, PointerProperty
 
 from ...rendering import project as rendering_project, custom_shaders, render_defaults
-from ...rendering.studio_render import resources
 
 ##########################################
 # CONST
 ##########################################
 
-NODE_CATEGORY_ID = "LEVEL5_SHADER_NODES"
+# What the code can read and write, shown in the Level 5 tab of the Text Editor
+HELP_LINES = (
+    "#pragma vertex_program \"#NAME\"",
+    "#pragma combiner \"#NAME\"",
+    "    take the one of the game",
+    "VERTEX_SHADER:",
+    "    atr_pos atr_nrm atr_clr",
+    "    atr_tx0-2 atr_pr0-2",
+    "    unf_vtx_lcl_glb[3]",
+    "    unf_vtx_glb_cmr[3]",
+    "    unf_vtx_cmr_prj[4]",
+    "    unf_vtx_txt[6] unf_vtx_clr",
+    "    unf_vtx_bone[72]",
+    "    gl_Position var_clr",
+    "    var_tx0-2 var_nrm var_prm",
+    "FRAGMENT_SHADER:",
+    "    texture2D(unf_frg_txt_2d_N,",
+    "        var_txN.xy)",
+    "    var_clr clr_1st clr_2nd",
+    "    + - * mix dot3 add_signed",
+    "    * 2.0 or * 4.0, 6 stages",
+)
 
 ##########################################
 # Shader Editor Function
 ##########################################
 
 def get_editor_shader(context):
-    """The shader of the Shader Editor, or of the text the Text Editor shows."""
+    """The shader the Text Editor shows."""
     space = context.space_data
 
-    if space is not None and space.type == 'NODE_EDITOR' and custom_shaders.is_shader(space.node_tree):
-        return space.node_tree
-
-    if space is not None and space.type == 'TEXT_EDITOR' and space.text is not None:
-        for tree in custom_shaders.get_shaders():
-            if tree.code == space.text:
-                return tree
+    if space is not None and space.type == 'TEXT_EDITOR' and custom_shaders.is_shader(space.text):
+        return space.text
 
     return None
 
@@ -38,79 +51,92 @@ def get_active_mesh(context):
 
     return None
 
-def open_window(context, area_type):
-    """A new window with one editor, the editor of the Studio Eleven panel stays as it is."""
-    bpy.ops.wm.window_new()
-    window = context.window_manager.windows[-1]
-    area = window.screen.areas[0]
-    area.type = area_type
+def get_unique_name(name):
+    unique = name
+    count = 1
 
-    return area
+    while custom_shaders.find_shader(unique) is not None or bpy.data.texts.get(unique + custom_shaders.SHADER_EXTENSION) is not None:
+        count += 1
+        unique = f"{name}_{count}"
 
-def open_shader_editor(context, tree):
-    area = open_window(context, 'NODE_EDITOR')
-    area.ui_type = custom_shaders.TREE_TYPE
+    return unique
 
-    if tree is not None:
-        area.spaces.active.node_tree = tree
+def show_text(context, text):
+    """The text in the Text Editor of the context, or in a new window."""
+    space = context.space_data
+
+    if space is None or space.type != 'TEXT_EDITOR':
+        bpy.ops.wm.window_new()
+        window = context.window_manager.windows[-1]
+        area = window.screen.areas[0]
+        area.type = 'TEXT_EDITOR'
+        space = area.spaces.active
+
+    space.text = text
+    space.top = 0
+    space.show_region_ui = True
 
 def source_items(self, context):
-    """Render defaults a new shader starts from: the custom shaders, then the ones of the scene engine."""
+    """What a new shader starts from: the templates, then the render defaults of the scene engine."""
     items = []
 
-    for tree in custom_shaders.get_shaders():
-        items.append((tree.name, tree.name, "Custom shader of the blend", 'NODE_MATERIAL', len(items)))
+    for shader_template in custom_shaders.get_templates():
+        items.append((f"TEMPLATE:{shader_template['file_name']}", shader_template["label"], "Template of Studio Eleven", 'TEXT', len(items)))
 
     for item in rendering_project.render_default_items(context.scene):
-        items.append((item[0], item[1], item[2], 'NONE', len(items)))
+        items.append((f"RENDER:{item[0]}", f"Copy of {item[1]}", item[2], 'NONE', len(items)))
 
-    return custom_shaders.remember_items(items)
+    return remember_items(items)
 
-def get_default_source(context):
-    mesh = get_active_mesh(context)
+remembered_items = {}
 
-    if mesh is not None:
-        return rendering_project.get_mesh_render_default(mesh.data).name
+def remember_items(items):
+    # Blender keeps a reference to the list of an enum
+    key = tuple(item[0] for item in items)
+    if key not in remembered_items:
+        remembered_items[key] = items
+    return remembered_items[key]
 
-    return render_defaults.get_default_render_default(rendering_project.get_scene_engine_id(context.scene)).name
+def get_source_code(context, source):
+    if source.startswith("TEMPLATE:"):
+        return custom_shaders.read_template(source[len("TEMPLATE:"):])
+
+    engine_id = rendering_project.get_scene_engine_id(context.scene)
+    render_default = render_defaults.find_render_default(engine_id, source[len("RENDER:"):])
+
+    if render_default is None:
+        return None
+
+    return custom_shaders.make_code_from_render_default(engine_id, render_default)
+
+def assign_shader(context, text):
+    meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+    for obj in meshes:
+        rendering_project.set_mesh_render_default(obj.data, custom_shaders.get_shader_name(text))
+
+    custom_shaders.clear_render_cache()
+
+    return len(meshes)
 
 ##########################################
 # Register class
 ##########################################
 
-class ShaderEditor_Open(bpy.types.Operator):
-    bl_idname = "studio_eleven.open_shader_editor"
-    bl_label = "Shader Editor"
-    bl_description = "Open the Shader Editor in a new window: the custom shaders of the blend as nodes, with their code"
-
-    def execute(self, context):
-        tree = None
-        mesh = get_active_mesh(context)
-
-        if mesh is not None:
-            tree = custom_shaders.get_mesh_shader(mesh.data)
-
-        if tree is None and len(custom_shaders.get_shaders()) > 0:
-            tree = custom_shaders.get_shaders()[0]
-
-        open_shader_editor(context, tree)
-
-        return {'FINISHED'}
-
 class ShaderEditor_New(bpy.types.Operator):
     bl_idname = "studio_eleven.new_shader"
     bl_label = "New Shader"
-    bl_description = "Make a custom shader from a render default: its vertex program and its combiner as nodes"
+    bl_description = "Make a custom shader of the blend: GLSL code from a template or from a render default of the game"
     bl_options = {'REGISTER', 'UNDO'}
 
     name: StringProperty(
         name="Name",
-        description="Name of the render default, a mesh stores its crc32. The name of a render default of fix.xr hides it for the archive",
+        description="Name of the render program, a mesh stores its crc32. The name of a render default of fix.xr hides it for the archive",
         default="#CUSTOM"
     )
     source: EnumProperty(
-        name="Copy Of",
-        description="Render default the shader starts from",
+        name="From",
+        description="Code the shader starts with",
         items=source_items
     )
     assign: BoolProperty(
@@ -120,288 +146,232 @@ class ShaderEditor_New(bpy.types.Operator):
     )
 
     def invoke(self, context, event):
-        default = get_default_source(context)
+        self.name = get_unique_name("#CUSTOM")
 
-        for item in source_items(self, context):
-            if item[0] == default:
-                self.source = default
+        # A copy of the render default of the active mesh by default
+        mesh = get_active_mesh(context)
+        if mesh is not None:
+            wanted = f"RENDER:{rendering_project.get_mesh_render_default(mesh.data).name}"
+            for item in source_items(self, context):
+                if item[0] == wanted:
+                    self.source = wanted
 
         return context.window_manager.invoke_props_dialog(self)
 
     def execute(self, context):
-        engine_id = rendering_project.get_scene_engine_id(context.scene)
-        shader = bpy.data.node_groups.get(self.source)
+        code = get_source_code(context, self.source)
 
-        if custom_shaders.is_shader(shader):
-            source = custom_shaders.make_render_default(shader, engine_id)
-        else:
-            source = render_defaults.find_render_default(engine_id, self.source)
-
-        if source is None:
-            self.report({'ERROR'}, f"Render default {self.source} not found")
+        if code is None:
+            self.report({'ERROR'}, f"{self.source} not found")
             return {'CANCELLED'}
 
-        stages = resources.render_default_stages(engine_id, source)
-        stage_dicts = None
-        if stages:
-            stage_dicts = [stage.to_dict() for stage in stages]
-
-        # The shader keeps the combiner of the game as it is until its nodes are edited
-        game_combiner = ""
-        if source.data.get("stages") is None:
-            game_combiner = source.data["combiner"]
-
-        tree = custom_shaders.new_shader(self.name, source.data["vertex_program"], stage_dicts, game_combiner, engine_id)
+        text = custom_shaders.new_shader(get_unique_name(self.name), code)
 
         if self.assign:
-            for obj in context.selected_objects:
-                if obj.type == 'MESH':
-                    rendering_project.set_mesh_render_default(obj.data, tree.name)
+            assign_shader(context, text)
 
+        show_text(context, text)
+
+        self.report({'INFO'}, f"Shader {custom_shaders.get_shader_name(text)} made")
+
+        return {'FINISHED'}
+
+class ShaderEditor_Template(bpy.types.Operator):
+    bl_idname = "studio_eleven.shader_template"
+    bl_label = "Level 5 Shader Template"
+    bl_description = "Make a custom shader of the blend from this template"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    file_name: StringProperty()
+
+    def execute(self, context):
+        text = custom_shaders.new_shader(get_unique_name("#CUSTOM"), custom_shaders.read_template(self.file_name))
+        show_text(context, text)
+
+        return {'FINISHED'}
+
+class ShaderEditor_MakeShader(bpy.types.Operator):
+    bl_idname = "studio_eleven.make_shader"
+    bl_label = "Use as a Level 5 Shader"
+    bl_description = "The text becomes a custom shader of the blend, compiled as it is typed"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
         space = context.space_data
-        if space is not None and space.type == 'NODE_EDITOR':
-            space.node_tree = tree
+        return space is not None and space.type == 'TEXT_EDITOR' and space.text is not None
 
-        custom_shaders.clear_render_cache()
-        self.report({'INFO'}, f"Shader {tree.name} made from {source.name}")
+    def execute(self, context):
+        text = context.space_data.text
+
+        # The extension .osl gives the coloring of a C-like language
+        if not text.name.endswith(custom_shaders.SHADER_EXTENSION):
+            text.name = get_unique_name(custom_shaders.get_shader_name(text)) + custom_shaders.SHADER_EXTENSION
+
+        text.level5_shader.is_shader = True
+        text.use_fake_user = True
+        custom_shaders.compile_shader(text)
 
         return {'FINISHED'}
 
-class ShaderEditor_Fill(bpy.types.Operator):
-    bl_idname = "studio_eleven.fill_shader"
-    bl_label = "Fill with Default Nodes"
-    bl_description = "Give the empty shader an Output node fed by a texture lit by the vertex color, and the vertex program of the engine default"
-    bl_options = {'REGISTER', 'UNDO'}
+class ShaderEditor_Compile(bpy.types.Operator):
+    bl_idname = "studio_eleven.compile_shader"
+    bl_label = "Compile"
+    bl_description = "Compile the shader now (it is done by itself half a second after the code stops changing)"
 
     @classmethod
     def poll(cls, context):
         return get_editor_shader(context) is not None
 
     def execute(self, context):
-        custom_shaders.fill_shader(get_editor_shader(context), rendering_project.get_scene_engine_id(context.scene))
-        return {'FINISHED'}
-
-class ShaderEditor_Assign(bpy.types.Operator):
-    bl_idname = "studio_eleven.assign_shader"
-    bl_label = "Assign to Selected Meshes"
-    bl_description = "Give this shader to the selected meshes"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return get_editor_shader(context) is not None
-
-    def execute(self, context):
-        tree = get_editor_shader(context)
-        meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
-
-        if len(meshes) == 0:
-            self.report({'ERROR'}, "No mesh selected")
-            return {'CANCELLED'}
-
-        for obj in meshes:
-            rendering_project.set_mesh_render_default(obj.data, tree.name)
-
-        custom_shaders.clear_render_cache()
-        self.report({'INFO'}, f"{tree.name} given to {len(meshes)} meshes")
-
-        return {'FINISHED'}
-
-class ShaderEditor_EditCode(bpy.types.Operator):
-    bl_idname = "studio_eleven.edit_shader_code"
-    bl_label = "Edit Code"
-    bl_description = "Open the code of the shader in a Text Editor, Apply Code makes the nodes again from it"
-
-    @classmethod
-    def poll(cls, context):
-        return get_editor_shader(context) is not None
-
-    def execute(self, context):
-        tree = get_editor_shader(context)
-        custom_shaders.shader_changed(tree)
-
-        text = custom_shaders.get_code_text(tree)
-
-        # Writing the code leaves the cursor after its last line, the editor would open below the code
-        text.current_line_index = 0
-        text.current_character = 0
-        text.select_end_line_index = 0
-        text.select_end_character = 0
-
-        area = open_window(context, 'TEXT_EDITOR')
-        area.spaces.active.text = text
-        area.spaces.active.top = 0
-
-        return {'FINISHED'}
-
-class ShaderEditor_ApplyCode(bpy.types.Operator):
-    bl_idname = "studio_eleven.apply_shader_code"
-    bl_label = "Apply Code"
-    bl_description = "Compile the code of the shader and make its nodes again from it now (it is done by itself half a second after the code stops changing)"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return get_editor_shader(context) is not None
-
-    def execute(self, context):
-        tree = get_editor_shader(context)
-        error = custom_shaders.apply_code(tree)
+        error = custom_shaders.compile_shader(get_editor_shader(context))
 
         if error:
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"{tree.name}: the nodes follow the code")
+        self.report({'INFO'}, "The shader compiles")
+
+        return {'FINISHED'}
+
+class ShaderEditor_Assign(bpy.types.Operator):
+    bl_idname = "studio_eleven.assign_shader"
+    bl_label = "Assign to Selected Meshes"
+    bl_description = "Give the shader to the selected meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_editor_shader(context) is not None
+
+    def execute(self, context):
+        text = get_editor_shader(context)
+        count = assign_shader(context, text)
+
+        if count == 0:
+            self.report({'ERROR'}, "No mesh selected")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"{custom_shaders.get_shader_name(text)} given to {count} meshes")
 
         return {'FINISHED'}
 
 class ShaderEditor_EditMeshShader(bpy.types.Operator):
     bl_idname = "studio_eleven.edit_mesh_shader"
     bl_label = "Edit Shader"
-    bl_description = "Open the shader of the mesh in the Shader Editor"
+    bl_description = "Open the code of the shader of the mesh in a Text Editor"
 
     def execute(self, context):
         mesh = get_active_mesh(context)
-        tree = None
+        text = None
         if mesh is not None:
-            tree = custom_shaders.get_mesh_shader(mesh.data)
+            text = custom_shaders.get_mesh_shader(mesh.data)
 
-        open_shader_editor(context, tree)
+        if text is None:
+            self.report({'ERROR'}, "The mesh has no custom shader")
+            return {'CANCELLED'}
+
+        show_text(context, text)
 
         return {'FINISHED'}
 
-def draw_status(layout, tree):
-    if custom_shaders.find_output_node(tree) is None:
-        box = layout.box()
-        box.label(text="Empty shader", icon='ERROR')
-        box.label(text="Add nodes with Shift A, at least an Output")
-        box.operator("studio_eleven.fill_shader", icon='NODETREE')
-        return
-
-    if tree.error:
-        box = layout.box()
-        box.alert = True
-        for line in split_text(tree.error, 40):
-            box.label(text=line)
-        return
-
-    if tree.game_combiner:
-        layout.label(text=f"Combiner {tree.game_combiner} of the game", icon='INFO')
-    else:
-        stages = custom_shaders.get_shader_stages(tree)
-        if stages is None:
-            layout.label(text="Not compiled yet, link the Output node", icon='INFO')
-        else:
-            layout.label(text=f"{len(stages)} / 6 stages", icon='CHECKMARK')
-
-    if not tree.vertex_program:
-        layout.label(text="Choose a vertex program", icon='ERROR')
-
-def split_text(text, width):
-    lines = []
-    line = ""
-
-    for word in text.split(" "):
-        if line and len(line) + len(word) + 1 > width:
-            lines.append(line)
-            line = word
-        elif line:
-            line += " " + word
-        else:
-            line = word
-
-    if line:
-        lines.append(line)
-
-    return lines
-
-class NODE_PT_level5_shader(bpy.types.Panel):
-    bl_space_type = 'NODE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = "Level 5"
-    bl_label = "Shader"
-
-    @classmethod
-    def poll(cls, context):
-        return context.space_data.tree_type == custom_shaders.TREE_TYPE
+class TEXT_MT_level5_templates(bpy.types.Menu):
+    bl_idname = "TEXT_MT_level5_templates"
+    bl_label = "Level 5 Shaders"
 
     def draw(self, context):
         layout = self.layout
-        tree = get_editor_shader(context)
 
-        layout.operator("studio_eleven.new_shader", icon='ADD')
+        for shader_template in custom_shaders.get_templates():
+            operator = layout.operator("studio_eleven.shader_template", text=shader_template["label"])
+            operator.file_name = shader_template["file_name"]
 
-        if tree is None:
-            return
+def draw_template_menu(self, context):
+    self.layout.menu(TEXT_MT_level5_templates.bl_idname)
 
-        layout.prop(tree, "name", text="Name")
-        layout.prop(tree, "vertex_program_choice", text="Vertex Program")
-        draw_status(layout, tree)
+def draw_status(layout, text):
+    properties = text.level5_shader
 
-        column = layout.column(align=True)
-        column.operator("studio_eleven.assign_shader", icon='CHECKMARK')
-        column.operator("studio_eleven.edit_shader_code", icon='TEXT')
-        column.operator("studio_eleven.apply_shader_code", icon='FILE_REFRESH')
+    if properties.error:
+        box = layout.box()
+        box.label(text="Error", icon='ERROR')
+        # The message is cut in lines the panel can show
+        words = properties.error.split(" ")
+        line = ""
+        for word in words:
+            if len(line) + len(word) > 42:
+                box.label(text=line)
+                line = ""
+            line += word + " "
+        if line:
+            box.label(text=line)
+        box.label(text="The last code that compiled is still used", icon='INFO')
+
+    column = layout.column(align=True)
+
+    if properties.vertex_program:
+        column.label(text=f"Vertex: {properties.vertex_program} of the game", icon='MESH_DATA')
+    elif properties.instruction_count:
+        column.label(text=f"Vertex: {properties.instruction_count} / 512 instructions", icon='MESH_DATA')
+
+    if properties.combiner:
+        column.label(text=f"Fragment: {properties.combiner} of the game", icon='SHADING_TEXTURE')
+    elif properties.stage_count:
+        column.label(text=f"Fragment: {properties.stage_count} / 6 stages", icon='SHADING_TEXTURE')
 
 class TEXT_PT_level5_shader(bpy.types.Panel):
+    bl_label = "Level 5 Shader"
+    bl_idname = "TEXT_PT_level5_shader"
     bl_space_type = 'TEXT_EDITOR'
     bl_region_type = 'UI'
     bl_category = "Level 5"
-    bl_label = "Shader"
-
-    @classmethod
-    def poll(cls, context):
-        return get_editor_shader(context) is not None
 
     def draw(self, context):
         layout = self.layout
-        tree = get_editor_shader(context)
+        text = context.space_data.text
 
-        layout.label(text=tree.name, icon='NODE_MATERIAL')
-        layout.operator("studio_eleven.apply_shader_code", icon='FILE_REFRESH')
-        draw_status(layout, tree)
+        layout.operator("studio_eleven.new_shader", icon='ADD')
+        layout.menu(TEXT_MT_level5_templates.bl_idname, icon='TEXT')
 
-        column = layout.box().column(align=True)
-        column.label(text="texture0..3, vertex_color")
-        column.label(text="light_diffuse, light_specular")
-        column.label(text="Channels: .rgb .a .r .g .b")
-        column.label(text="+ - * mix dot3 add_signed")
-        column.label(text="x * 2.0, x * 4.0: scale")
-        column.label(text="Results clamped to 0..1")
+        if text is None:
+            return
 
-class Level5ShaderNodeCategory(NodeCategory):
-    @classmethod
-    def poll(cls, context):
-        return context.space_data.tree_type == custom_shaders.TREE_TYPE
+        if not custom_shaders.is_shader(text):
+            layout.operator("studio_eleven.make_shader", icon='SHADING_TEXTURE')
+            return
 
-NODE_CATEGORIES = [
-    Level5ShaderNodeCategory("LEVEL5_INPUT", "Input", items=[
-        NodeItem("Level5NodeTexture"),
-        NodeItem("Level5NodeVertexColor"),
-        NodeItem("Level5NodeLighting"),
-        NodeItem("Level5NodeColor"),
-        NodeItem("Level5NodeValue"),
-    ]),
-    Level5ShaderNodeCategory("LEVEL5_OPERATION", "Operation", items=[
-        NodeItem("Level5NodeMath"),
-        NodeItem("Level5NodeSeparate"),
-    ]),
-    Level5ShaderNodeCategory("LEVEL5_OUTPUT", "Output", items=[
-        NodeItem("Level5NodeOutput"),
-    ]),
-]
+        layout.label(text=f"Render program: {custom_shaders.get_shader_name(text)}")
+        draw_status(layout, text)
 
-classes = custom_shaders.classes + (
-    ShaderEditor_Open,
+        column = layout.column(align=True)
+        column.operator("studio_eleven.assign_shader", icon='CHECKMARK')
+        column.operator("studio_eleven.compile_shader", icon='FILE_REFRESH')
+
+class TEXT_PT_level5_shader_help(bpy.types.Panel):
+    bl_label = "Names"
+    bl_idname = "TEXT_PT_level5_shader_help"
+    bl_space_type = 'TEXT_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Level 5"
+    bl_parent_id = "TEXT_PT_level5_shader"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        column = self.layout.column(align=True)
+        for line in HELP_LINES:
+            column.label(text=line)
+
+classes = (
+    custom_shaders.Level5ShaderProperties,
     ShaderEditor_New,
-    ShaderEditor_Fill,
+    ShaderEditor_Template,
+    ShaderEditor_MakeShader,
+    ShaderEditor_Compile,
     ShaderEditor_Assign,
-    ShaderEditor_EditCode,
-    ShaderEditor_ApplyCode,
     ShaderEditor_EditMeshShader,
-    NODE_PT_level5_shader,
+    TEXT_MT_level5_templates,
     TEXT_PT_level5_shader,
+    TEXT_PT_level5_shader_help,
 )
 
 ##########################################
@@ -412,16 +382,18 @@ def register_shader_editor():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    nodeitems_utils.register_node_categories(NODE_CATEGORY_ID, NODE_CATEGORIES)
+    bpy.types.Text.level5_shader = PointerProperty(type=custom_shaders.Level5ShaderProperties)
+    bpy.types.TEXT_MT_templates.append(draw_template_menu)
 
-    # The code typed in the Text Editor follows the nodes and the other way
-    bpy.app.timers.register(custom_shaders.watch_code, first_interval=1.0, persistent=True)
+    # The code typed in the Text Editor is compiled half a second after it stops changing
+    bpy.app.timers.register(custom_shaders.watch_shaders, first_interval=1.0, persistent=True)
 
 def unregister_shader_editor():
-    if bpy.app.timers.is_registered(custom_shaders.watch_code):
-        bpy.app.timers.unregister(custom_shaders.watch_code)
+    if bpy.app.timers.is_registered(custom_shaders.watch_shaders):
+        bpy.app.timers.unregister(custom_shaders.watch_shaders)
 
-    nodeitems_utils.unregister_node_categories(NODE_CATEGORY_ID)
+    bpy.types.TEXT_MT_templates.remove(draw_template_menu)
+    del bpy.types.Text.level5_shader
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

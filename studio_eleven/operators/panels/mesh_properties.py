@@ -23,8 +23,8 @@ def render_default_choice_items(self, context):
     # The custom shaders of the blend come first
     return rendering_project.mesh_render_default_items(self.id_data)
 
-def poll_shader(self, tree):
-    return tree.bl_idname == "Level5ShaderTree"
+def poll_shader(self, text):
+    return text.level5_shader.is_shader
 
 def get_program_name(render_program):
     """Name of a render program hash (hexadecimal) when a template uses it, the hash otherwise."""
@@ -55,8 +55,8 @@ class Level5MeshProperties(bpy.types.PropertyGroup):
 
     shader: PointerProperty(
         name="Shader",
-        description="Custom shader of the mesh (Shader Editor), written in the render library of its archive at the export",
-        type=bpy.types.NodeTree,
+        description="Custom shader of the mesh (a GLSL text of the blend), written in the render library of its archive at the export",
+        type=bpy.types.Text,
         poll=poll_shader
     )
 
@@ -105,7 +105,7 @@ class Level5_Panel(bpy.types.Panel):
             row = layout.row(align=True)
             row.prop(properties, "render_default_choice")
             if properties.shader is not None:
-                row.operator("studio_eleven.edit_mesh_shader", text="", icon='NODE_MATERIAL')
+                row.operator("studio_eleven.edit_mesh_shader", text="", icon='TEXT')
 
             if properties.unresolved_render_program:
                 layout.label(text=f"Program {get_program_name(properties.unresolved_render_program)} is kept on export", icon='INFO')

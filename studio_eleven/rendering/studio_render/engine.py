@@ -513,7 +513,11 @@ class StudioRenderEngine(bpy.types.RenderEngine):
                 source_factor=bound.state.blend_source,
             )
 
-            shader = shaders.get_shader(bound.program, options, bound.program_key)
+            vertex = None
+            if bound.render_default is not None and bound.render_default.data.get("vertex_glsl"):
+                vertex = bound.render_default.data["vertex_glsl"]
+
+            shader = shaders.get_shader(bound.program, options, bound.program_key, vertex)
             batch = draw.make_batch(shader, geometry, index)
             if batch is None:
                 continue

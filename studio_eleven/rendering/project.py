@@ -150,14 +150,14 @@ def mesh_render_default_items(mesh, scene=None):
     if len(shaders) == 0:
         return render_default_items(scene)
 
-    shader_names = [tree.name for tree in shaders]
+    shader_names = [custom_shaders.get_shader_name(text) for text in shaders]
     key = (game_manager.data_engine_id(get_scene_engine_id(scene)),) + tuple(shader_names)
 
     if key not in _mesh_items_cache:
         items = []
 
         for name in shader_names:
-            items.append((name, name, "Custom shader of the blend (Shader Editor), written in the archive of the mesh", 'NODE_MATERIAL', len(items)))
+            items.append((name, name, "Custom shader of the blend (Text Editor > Level 5), written in the archive of the mesh", 'TEXT', len(items)))
 
         for item in render_default_items(scene):
             # A custom shader hides the render default of fix.xr that has its name
@@ -171,7 +171,7 @@ def mesh_render_default_items(mesh, scene=None):
 def set_mesh_render_default(mesh, name):
     """Give the mesh a render default by its name: a custom shader of the blend or a render default of the engine."""
     properties = mesh.level5_properties
-    shader = bpy.data.node_groups.get(name)
+    shader = custom_shaders.find_shader(name)
 
     if custom_shaders.is_shader(shader):
         properties.shader = shader
@@ -221,7 +221,7 @@ def assign_render_default(mesh, engine_id):
 def assign_render_program(mesh, render_program_hash, engine_id, shaders=None):
     """Give the mesh a render program, the shaders of its archive come first like in the game, the export writes an unknown hash back."""
     if shaders and render_program_hash in shaders:
-        set_mesh_render_default(mesh, shaders[render_program_hash].name)
+        set_mesh_render_default(mesh, custom_shaders.get_shader_name(shaders[render_program_hash]))
         return custom_shaders.make_render_default(shaders[render_program_hash], engine_id)
 
     found = render_defaults.find_render_default_by_hash(engine_id, render_program_hash)
