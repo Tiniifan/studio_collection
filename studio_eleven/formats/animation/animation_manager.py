@@ -1,3 +1,5 @@
+import bisect
+import warnings
 from struct import pack, unpack, unpack_from, calcsize, Struct
 from io import BytesIO
 from enum import Enum
@@ -28,17 +30,76 @@ class Node:
         self.Name = name
         self.Interpolation = interpolation
         self.Frames = Frames if Frames else []
-        
+        # V1 files only: the frame -> key table as stored (the game reads it), its length (node +0x14, also the loop
+        # length of the game) and what is wrong with the keys or the table (empty for a well formed node)
+        self.FrameTable = None
+        self.TableLength = None
+        self.KeyIssues = []
+
     def frame_exists(self, frame_key):
         for frame in self.Frames:
             if frame.Key == frame_key:
                 return True
-                
+
         return False
-        
+
     def add_frame(self, frame_key, value):
         if self.frame_exists(frame_key) == False:
-            self.Frames.append(Frame(frame_key, value))
+            # Keep the keys sorted by frame whatever the call order
+            position = bisect.bisect_right([frame.Key for frame in self.Frames], frame_key)
+            self.Frames.insert(position, Frame(frame_key, value))
+
+
+def sort_frames(node):
+    """Sort the keys of a node by frame (in place), drop exact duplicates, refuse two different values on one frame.
+
+    The V1 frame -> key table and the game's interpolation (next key = next data entry) need increasing keys.
+    """
+    frames = sorted(node.Frames, key=lambda frame: frame.Key)
+    result = []
+    for frame in frames:
+        if result and result[-1].Key == frame.Key:
+            previous = result[-1].Value
+            if previous is frame.Value or previous == frame.Value:
+                continue
+            name = node.Name if isinstance(node.Name, str) else hex(node.Name)
+            raise ValueError(f"Node {name}: two different values on frame {frame.Key}")
+        result.append(frame)
+    node.Frames[:] = result
+
+
+def expected_frame_table(keys, size):
+    """For each frame, the index of the key with the greatest frame <= it (0 before the first key)."""
+    order = sorted(range(len(keys)), key=lambda index: keys[index])
+    table = [0] * size
+    position = -1
+    for frame in range(size):
+        while position + 1 < len(order) and keys[order[position + 1]] <= frame:
+            position += 1
+        if position >= 0:
+            table[frame] = order[position]
+    return table
+
+
+def frame_table_issues(keys, table, frame_count):
+    """What makes a V1 node read differently by the game than its keys say (empty list if nothing)."""
+    issues = []
+    breaks = [i for i in range(1, len(keys)) if keys[i] <= keys[i - 1]]
+    if breaks:
+        i = breaks[0]
+        issues.append(f"keys not increasing at {len(breaks)} place(s), first at index {i}: frame {keys[i - 1]} then {keys[i]}")
+    if len(table) != frame_count + 1:
+        issues.append(f"frame table has {len(table)} entries for {frame_count + 1} frames")
+    out_of_range = [frame for frame, index in enumerate(table) if index >= len(keys)]
+    if out_of_range:
+        issues.append(f"frame table points past the {len(keys)} keys at {len(out_of_range)} frame(s), first frame {out_of_range[0]}")
+    expected = expected_frame_table(keys, len(table))
+    wrong = [frame for frame in range(len(table)) if table[frame] != expected[frame] and table[frame] < len(keys)]
+    if wrong:
+        frame = wrong[0]
+        issues.append(f"frame table points to the wrong key at {len(wrong)} frame(s), first frame {frame}: "
+                      f"key {table[frame]} (frame {keys[table[frame]]}) instead of key {expected[frame]} (frame {keys[expected[frame]]})")
+    return issues
 
 class Track:
     def __init__(self, name: str, index: int=None, nodes: list[Node]=None):
@@ -66,6 +127,8 @@ class AnimationManager:
         self.AnimationName = AnimationName
         self.FrameCount = FrameCount
         self.Tracks: list[Track] = Tracks if Tracks else []
+        # (track name, node hash, issue) of the V1 nodes the game reads differently than their keys say
+        self.KeyIssues = []
         if reader:
             self.Read(reader)
     
@@ -118,6 +181,11 @@ class AnimationManager:
         else:
             self.Version = "V1"
             self.GetAnimationDataV1(reader, header)
+
+            if self.KeyIssues:
+                track_name, node_name, issue = self.KeyIssues[0]
+                warnings.warn(f"{self.AnimationName}: {len(self.KeyIssues)} V1 node issue(s) the game reads differently, "
+                              f"first {track_name} {node_name:#010x}: {issue}", stacklevel=2)
     
     def CountInTrack(self, searchIndex):
         if any(track.Index == searchIndex for track in self.Tracks):
@@ -353,6 +421,10 @@ class AnimationManager:
         if self.Tracks == None or len(self.Tracks) == 0:
             return
 
+        for track in self.Tracks:
+            for node in track.Nodes:
+                sort_frames(node)
+
         groups = self.GetGroupsV1()
 
         header.Track1Count = len(groups[0])
@@ -399,10 +471,14 @@ class AnimationManager:
                     writer.seek(nodeOffset)
                     writer.write(nodeHeader.Pack())
 
-                    # Write keyframe table
+                    # Write keyframe table (frame -> key index, the game reads it, the keys must be increasing)
+                    keys = [x.Key for x in node.Frames]
+                    frameTable = self.FillArray(keys, self.FrameCount + 1)
+                    issues = frame_table_issues(keys, frameTable, self.FrameCount)
+                    if issues:
+                        raise ValueError(f"{trackName} {nameInt:#010x}: {'; '.join(issues)}")
                     keyFrameOffset = writer.tell()
-                    writer.write(b''.join(struct.pack("<H", x) for x in self.FillArray(
-                        [x.Key for x in node.Frames], self.FrameCount + 1))) # This was horrible
+                    writer.write(b''.join(struct.pack("<H", x) for x in frameTable))
                     self.WriteAlignment(writer, 4, 0)
 
                     # Write different keyframe table
@@ -438,6 +514,10 @@ class AnimationManager:
             writerDecomp.write(compressor.compress(writer.getvalue()))
 
     def SaveAnimationDataV2(self, writerDecomp, header):
+        for track in self.Tracks:
+            for node in track.Nodes:
+                sort_frames(node)
+
         with BytesIO() as writer:
             hashCount = self.CountHashes()
 
@@ -546,6 +626,10 @@ class AnimationManager:
         reader.seek(tableHeader.DifferentKeyFrameOffset)
         differentFrames = [unpack("<H", reader.read(2))[0] for i in range(node.FrameLength // 2)]
         frames = []
+
+        # Frame -> key index table: the game picks the key of a frame here, not in the key list (sub_17C864)
+        reader.seek(tableHeader.KeyFrameOffset)
+        frameTable = [unpack("<H", reader.read(2))[0] for i in range(node.DifferentFrameCount)]
         
         for j in range(len(differentFrames)):
             # Get frame
@@ -576,7 +660,13 @@ class AnimationManager:
         if trackNum == 3:
             interpolation = animation_support.INTERPOLATION_CONSTANT
 
-        self.Tracks[trackIndex].Nodes.append(Node(node.BoneNameHash, interpolation, frames))
+        resultNode = Node(node.BoneNameHash, interpolation, frames)
+        resultNode.FrameTable = frameTable
+        resultNode.TableLength = node.DifferentFrameCount
+        resultNode.KeyIssues = frame_table_issues(differentFrames, frameTable, self.FrameCount)
+        for issue in resultNode.KeyIssues:
+            self.KeyIssues.append((self.Tracks[trackIndex].Name, node.BoneNameHash, issue))
+        self.Tracks[trackIndex].Nodes.append(resultNode)
         
         return tableOffset
     
