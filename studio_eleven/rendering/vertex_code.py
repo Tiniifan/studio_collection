@@ -1870,9 +1870,10 @@ void main() {
     studio_atr_clr = atr_clr;
     studio_atr_nrm = atr_nrm;
     studio_atr_tng = vec3(1.0, 0.0, 0.0);
-    studio_atr_tx0 = vec4(atr_tx0, 0.0, 1.0);
-    studio_atr_tx1 = vec4(atr_tx1, 0.0, 1.0);
-    studio_atr_tx2 = vec4(atr_tx2, 0.0, 1.0);
+    // The texture coordinates as the game gives them (studio_render/shaders.py NATIVE_UV_GLSL)
+    studio_atr_tx0 = studio_file_uv(atr_tx0);
+    studio_atr_tx1 = studio_file_uv(atr_tx1);
+    studio_atr_tx2 = studio_file_uv(atr_tx2);
 
     // Every bone is the identity and the vertex follows bone 0 with its whole weight
     studio_atr_pr0 = vec4(1.0, 0.0, 0.0, 0.0);
@@ -1892,12 +1893,12 @@ void main() {
         studio_unf_vtx_glb_cmr[i] = vec4(unf_vtx_glb_cmr[0][i], unf_vtx_glb_cmr[1][i], unf_vtx_glb_cmr[2][i], unf_vtx_glb_cmr[3][i]);
         studio_unf_vtx_lcl_glb[i] = vec4(unf_vtx_lcl_glb[0][i], unf_vtx_lcl_glb[1][i], unf_vtx_lcl_glb[2][i], unf_vtx_lcl_glb[3][i]);
     }
-    studio_unf_vtx_txt[0] = unf_vtx_txt_0;
-    studio_unf_vtx_txt[1] = unf_vtx_txt_1;
-    studio_unf_vtx_txt[2] = unf_vtx_txt_2;
-    studio_unf_vtx_txt[3] = unf_vtx_txt_3;
-    studio_unf_vtx_txt[4] = unf_vtx_txt_4;
-    studio_unf_vtx_txt[5] = unf_vtx_txt_5;
+    studio_unf_vtx_txt[0] = studio_native_row_0(unf_vtx_txt_1);
+    studio_unf_vtx_txt[1] = studio_native_row_1(unf_vtx_txt_0);
+    studio_unf_vtx_txt[2] = studio_native_row_0(unf_vtx_txt_3);
+    studio_unf_vtx_txt[3] = studio_native_row_1(unf_vtx_txt_2);
+    studio_unf_vtx_txt[4] = studio_native_row_0(unf_vtx_txt_5);
+    studio_unf_vtx_txt[5] = studio_native_row_1(unf_vtx_txt_4);
     studio_unf_vtx_eye = vec4(0.0);
     studio_unf_vtx_str = vec4(0.0);
 
@@ -1918,9 +1919,9 @@ void main() {
     studio_main();
 
     frg_clr = var_clr;
-    frg_tx0 = var_tx0.xy;
-    frg_tx1 = var_tx1.xy;
-    frg_tx2 = var_tx2.xy;
+    frg_tx0 = studio_upright_uv(var_tx0.xy);
+    frg_tx1 = studio_upright_uv(var_tx1.xy);
+    frg_tx2 = studio_upright_uv(var_tx2.xy);
     frg_nrm = normalize(var_nrm.xyz);
     frg_prm = var_prm.xyz;
 }
@@ -1928,6 +1929,9 @@ void main() {
 
 def make_blender_vertex(tree):
     """The VERTEX_SHADER section as a vertex stage of StudioRender, with its interface."""
+    # Imported here: the studio_render package imports the project, which imports this module
+    from .studio_render import shaders
+
     renames = {"main": "studio_main"}
 
     for name in ATTRIBUTES:
@@ -1939,7 +1943,7 @@ def make_blender_vertex(tree):
     # StudioRender sets unf_vtx_clr itself, with the same type as the game
     renames["unf_vtx_clr"] = "unf_vtx_clr"
 
-    lines = [BLENDER_VERTEX_HEADER]
+    lines = [BLENDER_VERTEX_HEADER, shaders.NATIVE_UV_GLSL]
 
     for declaration in tree["declarations"]:
         qualifiers = declaration["qualifiers"]

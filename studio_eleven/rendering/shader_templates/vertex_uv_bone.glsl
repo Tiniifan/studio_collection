@@ -49,9 +49,10 @@ void main() {
     gl_Position = vec4(dot(unf_vtx_cmr_prj[0], eye), dot(unf_vtx_cmr_prj[1], eye), dot(unf_vtx_cmr_prj[2], eye), dot(unf_vtx_cmr_prj[3], eye));
     var_clr = vec4(unf_vtx_clr.rgb * atr_clr.rgb, unf_vtx_clr.a * atr_clr.a) * 0.5;
 
-    // The location of the bone moves the texture coordinates
+    // The location of the bone moves the texture coordinates; the 3DS reads them turned, (u, v) is written (v, 1 - u)
     vec2 scroll = vec2(unf_vtx_bone[UV_BONE * 3].w, unf_vtx_bone[UV_BONE * 3 + 1].w);
-    var_tx0 = vec4(atr_tx0.xy + scroll, 0.0, 0.0);
+    vec2 uv = atr_tx0.xy + scroll;
+    var_tx0 = vec4(uv.y, 1.0 - uv.x, 0.0, 0.0);
 
     var_nrm = vec4(eye_normal, 0.0);
     var_prm = vec4(eye.xyz, 0.0);

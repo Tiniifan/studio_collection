@@ -46,6 +46,27 @@ vec2 studio_uv(vec2 uv, vec4 row_x, vec4 row_y) {
 }
 """
 
+# A vertex program of the game reads the UVs of the file (StudioRender keeps the V of Blender, 1 - v) and the rows of
+# unf_vtx_txt in the orientation of the 3DS textures, (u, v) given as (v, 1 - u); what it writes is read that way too.
+# Confirmed by a Citra trace of the uniforms (Ocean Birth particles), .docs/formats/animations.md
+NATIVE_UV_GLSL = """
+vec4 studio_file_uv(vec2 uv) {
+    return vec4(uv.x, 1.0 - uv.y, 0.0, 1.0);
+}
+
+vec4 studio_native_row_0(vec4 row_v) {
+    return vec4(-row_v.x, row_v.y, row_v.z, 1.0 - row_v.y - row_v.w);
+}
+
+vec4 studio_native_row_1(vec4 row_u) {
+    return vec4(-row_u.x, row_u.y, -row_u.z, 1.0 - row_u.y - row_u.w);
+}
+
+vec2 studio_upright_uv(vec2 uv) {
+    return vec2(1.0 - uv.y, 1.0 - uv.x);
+}
+"""
+
 # The stages halve the colour and the combiners double it back, the flat shaders (VTX014 + FRG005) return unf_vtx_clr as it is
 VERTEX_BODY = """
 void main() {

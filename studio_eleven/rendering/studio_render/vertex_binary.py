@@ -27,16 +27,15 @@ BOOL_UNIFORM_START = 0x78
 # Calls are inlined, the PICA200 has a call stack of 4
 MAX_CALL_DEPTH = 8
 
-# StudioRender keeps the V of Blender (1 - V of the file), the program reads and writes the V of the file:
-# some programs keep data in the texture coordinates
+# The texture coordinates are read and written as the game does (shaders.NATIVE_UV_GLSL): some programs keep data in them
 ATTRIBUTES = {
     "atr_pos": "vec4(atr_pos, 1.0)",
     "atr_clr": "atr_clr",
     "atr_nrm": "vec4(atr_nrm, 1.0)",
     "atr_tng": "vec4(1.0, 0.0, 0.0, 1.0)",
-    "atr_tx0": "vec4(atr_tx0.x, 1.0 - atr_tx0.y, 0.0, 1.0)",
-    "atr_tx1": "vec4(atr_tx1.x, 1.0 - atr_tx1.y, 0.0, 1.0)",
-    "atr_tx2": "vec4(atr_tx2.x, 1.0 - atr_tx2.y, 0.0, 1.0)",
+    "atr_tx0": "studio_file_uv(atr_tx0)",
+    "atr_tx1": "studio_file_uv(atr_tx1)",
+    "atr_tx2": "studio_file_uv(atr_tx2)",
     "atr_pr0": "vec4(1.0, 0.0, 0.0, 0.0)",
     "atr_pr1": "vec4(0.0)",
     "atr_pr2": "vec4(0.0)",
@@ -92,14 +91,6 @@ vec4 studio_uniform(int index) {
         return vec4(1.0);
     }
     return studio_c[index];
-}
-
-vec4 studio_row_u(vec4 row) {
-    return vec4(row.x, -row.y, row.z, row.y + row.w);
-}
-
-vec4 studio_row_v(vec4 row) {
-    return vec4(-row.x, row.y, row.z, 1.0 - row.y - row.w);
 }
 
 vec3 studio_rotate(vec4 q, vec3 v) {
@@ -453,9 +444,9 @@ def write_uniforms(program):
         elif name == "unf_vtx_txt":
             for row in range(min(size, 6)):
                 if row % 2 == 0:
-                    lines.append(f"    studio_c[{first + row}] = studio_row_u(unf_vtx_txt_{row});")
+                    lines.append(f"    studio_c[{first + row}] = studio_native_row_0(unf_vtx_txt_{row + 1});")
                 else:
-                    lines.append(f"    studio_c[{first + row}] = studio_row_v(unf_vtx_txt_{row});")
+                    lines.append(f"    studio_c[{first + row}] = studio_native_row_1(unf_vtx_txt_{row - 1});")
         elif name == "unf_vtx_bone":
             for row in range(size):
                 lines.append(f"    studio_c[{first + row}] = studio_bone_rows[{row % 3}];")
@@ -486,9 +477,9 @@ def write_outputs(program):
 
     for unit, name in enumerate(("TEXCOORD0", "TEXCOORD1", "TEXCOORD2")):
         if name in registers and len(masks[name]) >= 2:
-            lines.append(f"    frg_tx{unit} = vec2({registers[name]}.{masks[name][0]}, 1.0 - {registers[name]}.{masks[name][1]});")
+            lines.append(f"    frg_tx{unit} = studio_upright_uv({registers[name]}.{masks[name][:2]});")
         elif name in registers:
-            lines.append(f"    frg_tx{unit} = vec2({registers[name]}.{masks[name]}, 1.0);")
+            lines.append(f"    frg_tx{unit} = studio_upright_uv(vec2({registers[name]}.{masks[name]}, 0.0));")
         else:
             lines.append(f"    frg_tx{unit} = vec2(0.0);")
 
@@ -526,7 +517,7 @@ def make_vertex_glsl(data, program_index=0):
 
     declarations, constants = write_constants(program)
 
-    lines = [shaders.VERTEX_COMMON, HELPERS_GLSL]
+    lines = [shaders.VERTEX_COMMON, shaders.NATIVE_UV_GLSL, HELPERS_GLSL]
     lines += declarations
     lines.append("")
     lines.append("void studio_program() {")
