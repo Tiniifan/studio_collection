@@ -39,6 +39,9 @@ DEFAULT_TEMPLATE = "texture_vertex_color.glsl"
 # Code typed and not compiled yet, it is compiled once it stops changing
 pending = {}
 
+# Vertex stages written from the vertex binaries of imported archives, by (entry, binary)
+embedded_vertex_stages = {}
+
 ##########################################
 # Shader Function
 ##########################################
@@ -123,6 +126,11 @@ def make_render_default(text, engine_id):
     else:
         skinned = render_defaults.find_vertex_program_skinned(engine_id, vertex_program)
 
+    # The vertex program of an imported archive is only a binary, StudioRender draws it written as GLSL
+    vertex_glsl = properties.vertex_glsl
+    if not vertex_glsl and vertex_program == properties.embedded_vertex_program_name and properties.embedded_shader_binary:
+        vertex_glsl = get_embedded_vertex_glsl(text)
+
     data = {
         "name": get_shader_name(text),
         "vertex_program": vertex_program,
@@ -130,8 +138,8 @@ def make_render_default(text, engine_id):
         "skinned": skinned,
         "fragment_lighting": fragment_lighting,
         "stages": stages,
-        "vertex_glsl": properties.vertex_glsl,
-        "key": json.dumps([get_shader_name(text), vertex_program, combiner, stages, properties.vertex_glsl]),
+        "vertex_glsl": vertex_glsl,
+        "key": json.dumps([get_shader_name(text), vertex_program, combiner, stages, vertex_glsl]),
     }
 
     return render_defaults.RenderDefault(engine_id, data)
@@ -153,6 +161,25 @@ def redraw_editors():
 ##########################################
 # Compile
 ##########################################
+
+def get_embedded_vertex_glsl(text):
+    """The vertex binary of an imported archive written as a StudioRender vertex stage, empty when it can't be written."""
+    from .studio_render import vertex_binary
+
+    properties = text.level5_shader
+    key = (properties.embedded_vertex_program, properties.embedded_shader_binary)
+
+    if key not in embedded_vertex_stages:
+        embedded_vertex_stages[key] = ""
+
+        try:
+            entry = bytes.fromhex(properties.embedded_vertex_program)
+            data = bytes.fromhex(properties.embedded_shader_binary)
+            embedded_vertex_stages[key] = vertex_binary.make_vertex_glsl(data, vertex_binary.get_program_index(entry))
+        except Exception as error:
+            print(f"[Studio Eleven] {get_shader_name(text)}: the vertex program {properties.embedded_vertex_program_name} is drawn with the vertex stage of StudioRender ({error})")
+
+    return embedded_vertex_stages[key]
 
 def compile_shader(text):
     """Compiles the code of a shader into its properties, returns the error, empty when it compiles."""
